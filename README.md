@@ -12,10 +12,12 @@ Files only: no calendar, no contacts, no office suite.
 - Atomic writes (temporary file, then rename) with BLAKE3 hashing
 - Per-user accounts (Argon2 password hashes) and app tokens, HTTP Basic auth
 - File metadata and versions in PostgreSQL
+- WebDAV at `/dav/` (per-user root)
+- Original modification times are kept when the client sends `X-OC-Mtime`
 
 ## Planned
 
-- WebDAV, so existing clients can connect
+- Bulk import tooling
 - Delta transfers (rsync algorithm)
 - Change feed for sync clients
 - Public share links

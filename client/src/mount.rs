@@ -328,7 +328,8 @@ impl Shared {
                     path: entry.path,
                     dir: entry.dir,
                     size: entry.size,
-                    mtime: entry.mtime,
+                    // Serverul nu tine data directoarelor; aratam momentul in care le-am aflat.
+                    mtime: if entry.dir && entry.mtime == 0 { now() } else { entry.mtime },
                     hash: entry.hash,
                     version: entry.version,
                     local: None,
@@ -730,7 +731,10 @@ impl Filesystem for Drive {
     fn flush(&self, _req: &Request, ino: INodeNo, fh: FileHandle, _lock: LockOwner, reply: ReplyEmpty) {
         // La inchidere, ce s-a scris pleaca pe server; programul afla daca nu a reusit.
         let writable = self.0.handles().get(&fh.0).is_some_and(|h| h.writable);
-        if writable {
+        // Un fisier nou, inca gol, asteapta: multe programe inchid o copie a descriptorului
+        // inainte sa scrie. Daca ramane gol, este urcat la inchiderea finala.
+        let still_empty = self.0.tree().nodes.get(&ino.0).is_some_and(|n| n.version == 0 && n.size == 0);
+        if writable && !still_empty {
             if let Err(e) = self.0.upload(ino.0) {
                 return reply.error(e);
             }

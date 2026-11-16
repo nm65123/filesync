@@ -223,6 +223,7 @@ impl Api {
     }
 
     /// Muta sau redenumeste pe server (un fisier existent la destinatie este inlocuit).
+    #[cfg(unix)]
     pub fn rename(&self, from: &str, to: &str) -> Result<(), Fail> {
         let url = format!("{}/api/move", self.base);
         let body = serde_json::json!({ "from": from, "to": to }).to_string();

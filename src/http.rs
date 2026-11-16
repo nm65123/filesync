@@ -1,9 +1,5 @@
 use crate::index;
-use crate::util::{human, safe, set_mtime};
-use argon2::{
-    password_hash::{PasswordHash, PasswordVerifier},
-    Argon2,
-};
+use crate::util::{human, safe, set_mtime, verify_password};
 use axum::{
     body::Body,
     extract::{Path, Query, Request, State},
@@ -26,6 +22,10 @@ pub struct App {
     pub data: PathBuf,
     pub dav: DavHandler,
     pub cert: Option<PathBuf>,
+    /// Serverul vorbeste HTTPS.
+    pub tls: bool,
+    /// Adresa publica (FILESYNC_URL), folosita in linkurile de partajare.
+    pub public_url: Option<String>,
 }
 
 pub struct User {
@@ -45,14 +45,15 @@ pub fn router(app: App) -> Router {
         .route("/dav", any(dav_root))
         .route("/dav/", any(dav_root))
         .route("/dav/{*path}", any(dav_path))
+        .merge(crate::share::routes())
         .with_state(app)
 }
 
-fn text(status: StatusCode, message: impl Into<String>) -> Response {
+pub fn text(status: StatusCode, message: impl Into<String>) -> Response {
     (status, message.into() + "\n").into_response()
 }
 
-fn internal<E: std::fmt::Display>(e: E) -> Response {
+pub fn internal<E: std::fmt::Display>(e: E) -> Response {
     eprintln!("eroare: {e}");
     StatusCode::INTERNAL_SERVER_ERROR.into_response()
 }
@@ -82,7 +83,7 @@ fn content_length(headers: &HeaderMap) -> Option<u64> {
 }
 
 /// Verifica tokenul sau parola din antetul Authorization (HTTP Basic).
-async fn auth(app: &App, headers: &HeaderMap) -> Result<User, Response> {
+pub async fn auth(app: &App, headers: &HeaderMap) -> Result<User, Response> {
     let value = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -116,13 +117,9 @@ async fn auth(app: &App, headers: &HeaderMap) -> Result<User, Response> {
 
     if by_token.is_none() {
         let secret = secret.to_string();
-        let valid = tokio::task::spawn_blocking(move || {
-            PasswordHash::new(&password)
-                .map(|hash| Argon2::default().verify_password(secret.as_bytes(), &hash).is_ok())
-                .unwrap_or(false)
-        })
-        .await
-        .unwrap_or(false);
+        let valid = tokio::task::spawn_blocking(move || verify_password(&password, &secret))
+            .await
+            .unwrap_or(false);
         if !valid {
             return Err(unauthorized());
         }

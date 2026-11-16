@@ -12,6 +12,8 @@ Files only: no calendar, no contacts, no office suite.
 - Built-in HTTPS with a self-signed certificate. It works with a bare IP
   address; no domain name is needed.
 - Original file dates are kept when the client sends them (rclone does).
+- Public share links for a file or a directory, optionally with a password
+  and an expiry date.
 - Every file and directory is indexed in PostgreSQL (size, BLAKE3 hash, date,
   version). A change feed tells sync clients what changed since their last
   visit.
@@ -85,8 +87,10 @@ runuser -u filesync -- env FILESYNC_DATA=/var/lib/filesync \
 
 For example `filesync gencert 192.168.0.48 files.example.org`. The command
 prints the certificate's **SHA-256 fingerprint**. Write it down: you need it
-in step 3.1. The certificate is valid for 825 days; run the same command
-again to renew it, then restart the service.
+in step 3.1. The certificate is valid for 825 days. To renew it, run the same
+command with `--force` added and restart the service. A new certificate
+replaces the old one, so every computer has to repeat step 3.1; that is why
+the command refuses to overwrite an existing certificate without `--force`.
 
 ### 1.6 Start it as a service
 
@@ -153,6 +157,9 @@ letters, digits, `.`, `-` and `_`.
 | `filesync tokens alice`              | list the account's tokens            |
 | `filesync deltoken alice ID`         | delete one token (`all` for all)     |
 | `filesync reindex [alice]`           | rebuild the index from the disk      |
+| `filesync share alice docs/a.pdf`    | create a public link (see 3.6)       |
+| `filesync shares [alice]`            | list the links                       |
+| `filesync unshare CODE`              | delete a link                        |
 | `filesync help`                      | list all commands                    |
 
 Clients log in with the user name and either the password or, better, an
@@ -267,6 +274,43 @@ curl -u alice:TOKEN "https://192.168.0.48:8443/api/changes?since=0"
 - `hash` is the BLAKE3 hash of the content, `mtime` the file date in Unix
   seconds, `version` counts the changes to that path.
 
+### 3.6 Share links
+
+A link gives anyone who has it access to one file or one directory, without
+an account. On the server:
+
+```sh
+filesync share alice docs/report.pdf
+filesync share alice photos --days 7 --password     # asks for the password
+```
+
+The command prints the address, for example
+`https://192.168.0.48:8443/s/7b4ec5e01cd02facd44ef411ca29eb37`.
+
+- A link to a file downloads it. A link to a directory shows a page with its
+  content; everything below that directory is reachable, nothing above it.
+- With `--password`, the browser asks for the password (the user name field
+  can be left empty or filled with anything).
+- With `--days N`, the link stops working after N days.
+- `filesync shares` lists the links and how often each was used;
+  `filesync unshare CODE` deletes one. Disabling a user disables the links.
+- If the shared file or directory is moved, renamed or deleted, the link
+  stops working.
+
+Users can manage their own links through the API:
+
+```sh
+curl -u alice:TOKEN -H "Content-Type: application/json" \
+     -d '{"path":"photos","days":7,"password":"secret"}' \
+     https://192.168.0.48:8443/api/shares           # create; returns the url
+curl -u alice:TOKEN https://192.168.0.48:8443/api/shares                # list
+curl -u alice:TOKEN -X DELETE https://192.168.0.48:8443/api/shares/CODE  # delete
+```
+
+If people outside reach the server under another address than the one it
+listens on (a domain name, a forwarded port), set `FILESYNC_URL` to that
+address so the links are printed correctly.
+
 ---
 
 ## 4. Update
@@ -295,6 +339,7 @@ Set in `/etc/filesync.env`; restart the service after a change.
 | `FILESYNC_TLS_CERT`      | `$FILESYNC_DATA/tls/cert.pem` | certificate (PEM)                    |
 | `FILESYNC_TLS_KEY`       | `$FILESYNC_DATA/tls/key.pem`  | private key (PEM)                    |
 | `FILESYNC_INSECURE_HTTP` | unset                         | `1` allows plain HTTP on the network |
+| `FILESYNC_URL`           | unset                         | public address, used in share links  |
 
 If the certificate and key exist, the server speaks HTTPS. Without them it
 speaks plain HTTP, and only on `127.0.0.1`, because passwords would otherwise
@@ -312,7 +357,7 @@ Where things are:
 | `/var/lib/filesync/files/NAME` | the files of user `NAME`        |
 | `/var/lib/filesync/tls`        | certificate and private key     |
 | `/etc/filesync.env`            | settings, database password     |
-| PostgreSQL database `filesync` | users, tokens, file index       |
+| PostgreSQL database `filesync` | users, tokens, links, file index |
 
 The index can always be rebuilt from the files with `filesync reindex`.
 
@@ -328,11 +373,13 @@ Back up the data directory and the database together.
 - A file uploaded through WebDAV is read once more after the upload, to
   compute its hash.
 - WebDAV `COPY` is not checked against the quota.
+- Share links: wrong passwords are not rate-limited, and a shared directory
+  cannot be downloaded as a single archive.
 - The group and administrator flag are stored but not used yet.
 - Server messages are in Romanian.
 
-Planned: delta transfers (rsync algorithm), public share links, desktop
-client with virtual files.
+Planned: delta transfers (rsync algorithm), desktop client with virtual
+files.
 
 ## License
 

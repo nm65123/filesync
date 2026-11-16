@@ -1,9 +1,6 @@
 use crate::index;
-use crate::util::{human, parse_size, random_hex, valid_name};
-use argon2::{
-    password_hash::{rand_core::OsRng, PasswordHasher, SaltString},
-    Argon2,
-};
+use crate::share;
+use crate::util::{hash_password, human, parse_size, random_hex, valid_name};
 use sqlx::PgPool;
 use std::path::Path;
 
@@ -24,7 +21,12 @@ filesync addtoken <nume>          creeaza un token (parola de aplicatie)
 filesync tokens <nume>            listeaza tokenurile
 filesync deltoken <nume> <id|all> sterge un token sau pe toate
 filesync reindex [nume]           reface indexul dupa ce este pe disc
-filesync gencert <nume|ip>...     genereaza un certificat self-signed
+filesync share <nume> <cale> [--days N] [--password]
+                                  creeaza un link public catre un fisier sau director
+filesync shares [nume]            listeaza linkurile
+filesync unshare <cod>            sterge un link
+filesync gencert <nume|ip>... [--force]
+                                  genereaza un certificat self-signed
 filesync help                     acest text";
 
 fn arg<'a>(args: &'a [String], index: usize, what: &str) -> Res<&'a str> {
@@ -82,6 +84,89 @@ pub async fn run(pool: &PgPool, data: &Path, args: &[String]) -> Res<bool> {
             changed(done.rows_affected(), name)?;
         }
         "users" => list_users(pool).await?,
+        "share" => {
+            let name = arg(args, 1, "numele")?;
+            let path = arg(args, 2, "calea fisierului sau a directorului")?;
+            let mut days = None;
+            let mut password = None;
+            let mut rest = args[3..].iter();
+            while let Some(option) = rest.next() {
+                match option.as_str() {
+                    "--days" => {
+                        let value = rest.next().ok_or("--days are nevoie de un numar")?;
+                        days = Some(value.parse::<i64>().map_err(|_| "--days are nevoie de un numar")?);
+                    }
+                    "--password" => {
+                        eprint!("parola pentru link: ");
+                        let mut line = String::new();
+                        std::io::stdin().read_line(&mut line)?;
+                        let line = line.trim_end_matches(['\r', '\n']).to_string();
+                        if line.is_empty() {
+                            return Err("parola nu poate fi goala".into());
+                        }
+                        password = Some(line);
+                    }
+                    other => return Err(format!("optiune necunoscuta: {other}").into()),
+                }
+            }
+            let (id,) = sqlx::query_as::<_, (i32,)>("SELECT id FROM users WHERE name = $1")
+                .bind(name)
+                .fetch_optional(pool)
+                .await?
+                .ok_or_else(|| format!("utilizator inexistent: {name}"))?;
+            let (token, path, expires) =
+                share::new_share(pool, data, id, name, path, password.as_deref(), days)
+                    .await
+                    .map_err(|(_, message)| message)?;
+            eprintln!(
+                "link creat pentru {name}:{path}{}{}",
+                if password.is_some() { ", cu parola" } else { "" },
+                match (days, expires) {
+                    (Some(days), Some(_)) => format!(", expira in {days} zile"),
+                    _ => ", fara expirare".to_string(),
+                }
+            );
+            println!("{}", link(&token));
+        }
+        "shares" => {
+            let only = args.get(1).map(String::as_str);
+            let rows = sqlx::query_as::<_, (String, String, String, Option<String>, bool, i64)>(
+                "SELECT s.token, u.name, s.path, to_char(s.expires, 'YYYY-MM-DD HH24:MI'),
+                        s.password IS NOT NULL, s.downloads
+                 FROM shares s JOIN users u ON u.id = s.owner
+                 WHERE $1::text IS NULL OR u.name = $1
+                 ORDER BY u.name, s.created",
+            )
+            .bind(only)
+            .fetch_all(pool)
+            .await?;
+            println!(
+                "{:<32} {:<16} {:<17} {:<6} {:>9}  {}",
+                "COD", "UTILIZATOR", "EXPIRA", "PAROLA", "DESCARCAT", "CALE"
+            );
+            for (token, name, path, expires, password, downloads) in rows {
+                println!(
+                    "{:<32} {:<16} {:<17} {:<6} {:>9}  {}",
+                    token,
+                    name,
+                    expires.as_deref().unwrap_or("niciodata"),
+                    if password { "da" } else { "nu" },
+                    downloads,
+                    path
+                );
+            }
+        }
+        "unshare" => {
+            let token = arg(args, 1, "codul linkului")?;
+            let done = sqlx::query("DELETE FROM shares WHERE token = $1")
+                .bind(token)
+                .execute(pool)
+                .await?;
+            if done.rows_affected() == 0 {
+                return Err(format!("link inexistent: {token}").into());
+            }
+            eprintln!("link sters");
+        }
         "reindex" => {
             let only = args.get(1).map(String::as_str);
             let users = sqlx::query_as::<_, (i32, String)>("SELECT id, name FROM users ORDER BY name")
@@ -223,11 +308,26 @@ fn read_password(name: &str) -> Res<String> {
     if password.len() < 8 {
         return Err("parola trebuie sa aiba cel putin 8 caractere".into());
     }
-    let salt = SaltString::generate(&mut OsRng);
-    Ok(Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .map_err(|e| e.to_string())?
-        .to_string())
+    Ok(hash_password(password)?)
+}
+
+/// Adresa completa a unui link, daca stim sub ce adresa este vazut serverul.
+fn link(token: &str) -> String {
+    let base = std::env::var("FILESYNC_URL")
+        .ok()
+        .map(|url| url.trim_end_matches('/').to_string())
+        .filter(|url| !url.is_empty())
+        .or_else(|| {
+            let listen: std::net::SocketAddr = std::env::var("FILESYNC_LISTEN").ok()?.parse().ok()?;
+            (!listen.ip().is_unspecified()).then(|| format!("https://{listen}"))
+        });
+    match base {
+        Some(base) => format!("{base}/s/{token}"),
+        None => {
+            eprintln!("(seteaza FILESYNC_URL ca sa primesti adresa completa)");
+            format!("/s/{token}")
+        }
+    }
 }
 
 async fn list_users(pool: &PgPool) -> Res<()> {
@@ -261,7 +361,9 @@ async fn list_users(pool: &PgPool) -> Res<()> {
 }
 
 /// Certificat self-signed pentru numele si adresele IP date, cu ajutorul `openssl`.
-fn gencert(data: &Path, names: &[String]) -> Res<()> {
+fn gencert(data: &Path, args: &[String]) -> Res<()> {
+    let force = args.iter().any(|a| a == "--force");
+    let names: Vec<&String> = args.iter().filter(|a| *a != "--force").collect();
     if names.is_empty() {
         return Err("gencert: da cel putin un nume sau o adresa IP".into());
     }
@@ -269,6 +371,15 @@ fn gencert(data: &Path, names: &[String]) -> Res<()> {
     std::fs::create_dir_all(&dir)?;
     let cert = dir.join("cert.pem");
     let key = dir.join("key.pem");
+    if cert.exists() && !force {
+        return Err(format!(
+            "exista deja un certificat: {}\n\
+             Unul nou il inlocuieste, iar toate calculatoarele care l-au instalat pe cel \
+             actual vor trebui sa il instaleze pe cel nou. Daca asta vrei, adauga --force.",
+            cert.display()
+        )
+        .into());
+    }
     let san = names
         .iter()
         .map(|n| match n.parse::<std::net::IpAddr>() {

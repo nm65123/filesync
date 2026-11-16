@@ -1,6 +1,7 @@
 mod admin;
 mod http;
 mod index;
+mod share;
 mod util;
 
 use dav_server::{fakels::FakeLs, DavHandler};
@@ -8,7 +9,7 @@ use sqlx::postgres::PgPoolOptions;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-const SCHEMA: [&str; 14] = [
+const SCHEMA: [&str; 15] = [
     "CREATE TABLE IF NOT EXISTS users (
         id       SERIAL PRIMARY KEY,
         name     TEXT NOT NULL UNIQUE,
@@ -42,6 +43,16 @@ const SCHEMA: [&str; 14] = [
     "CREATE INDEX IF NOT EXISTS files_owner_seq ON files (owner, seq)",
     // Randurile dinaintea indexului primesc si ele un numar de ordine
     "UPDATE files SET seq = nextval('files_seq') WHERE seq = 0",
+    // Linkuri publice de partajare
+    "CREATE TABLE IF NOT EXISTS shares (
+        token     TEXT PRIMARY KEY,
+        owner     INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        path      TEXT NOT NULL,
+        password  TEXT,
+        expires   TIMESTAMPTZ,
+        created   TIMESTAMPTZ NOT NULL DEFAULT now(),
+        downloads BIGINT NOT NULL DEFAULT 0
+    )",
 ];
 
 #[tokio::main]
@@ -93,6 +104,11 @@ async fn start() -> Result<(), Box<dyn std::error::Error>> {
         data,
         dav,
         cert: tls.then(|| cert.clone()),
+        tls,
+        public_url: std::env::var("FILESYNC_URL")
+            .ok()
+            .map(|url| url.trim_end_matches('/').to_string())
+            .filter(|url| !url.is_empty()),
     });
 
     let addr: SocketAddr = std::env::var("FILESYNC_LISTEN")

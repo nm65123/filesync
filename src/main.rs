@@ -98,7 +98,18 @@ async fn start() -> Result<(), Box<dyn std::error::Error>> {
             .serve(app.into_make_service())
             .await?;
     } else {
-        println!("ascult pe http://{addr} (fara TLS: ruleaza `filesync gencert`)");
+        // Fara TLS parolele ar circula necriptat, deci acceptam doar adresa locala,
+        // sau un proxy care face el HTTPS (FILESYNC_INSECURE_HTTP=1).
+        let allowed = std::env::var("FILESYNC_INSECURE_HTTP").is_ok_and(|v| v == "1");
+        if !addr.ip().is_loopback() && !allowed {
+            return Err(format!(
+                "nu exista certificat TLS, iar {addr} nu este o adresa locala. \
+                 Ruleaza `filesync gencert <ip sau nume>` sau, daca in fata este un proxy \
+                 care face HTTPS, seteaza FILESYNC_INSECURE_HTTP=1."
+            )
+            .into());
+        }
+        println!("ascult pe http://{addr} (fara TLS)");
         let listener = tokio::net::TcpListener::bind(addr).await?;
         axum::serve(listener, app).await?;
     }

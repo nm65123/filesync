@@ -42,6 +42,7 @@ pub fn router(app: App) -> Router {
         .route("/cert.crt", get(cert))
         .route("/files/{*path}", get(download).put(upload).delete(remove))
         .route("/api/changes", get(changes))
+        .route("/api/dirs/{*path}", axum::routing::put(make_dir))
         .route("/dav", any(dav_root))
         .route("/dav/", any(dav_root))
         .route("/dav/{*path}", any(dav_path))
@@ -76,6 +77,30 @@ fn oc_mtime(headers: &HeaderMap) -> Option<i64> {
         .parse::<i64>()
         .ok()
         .filter(|s| *s >= 0)
+}
+
+/// Versiunea pe care clientul crede ca o are serverul (antetul X-Filesync-If-Version).
+/// 0 inseamna "calea nu trebuie sa existe". Fara antet nu se verifica nimic.
+fn if_version(headers: &HeaderMap) -> Result<Option<i64>, Response> {
+    match headers.get("x-filesync-if-version") {
+        None => Ok(None),
+        Some(value) => value
+            .to_str()
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .map(Some)
+            .ok_or_else(|| text(StatusCode::BAD_REQUEST, "X-Filesync-If-Version invalid.")),
+    }
+}
+
+/// Raspunsul dat cand pe server este alta versiune decat cea asteptata de client.
+fn version_mismatch(current: i64) -> Response {
+    let mut resp = text(
+        StatusCode::PRECONDITION_FAILED,
+        "Pe server este alta versiune decat cea asteptata.",
+    );
+    resp.headers_mut().insert("x-filesync-version", HeaderValue::from(current));
+    resp
 }
 
 fn content_length(headers: &HeaderMap) -> Option<u64> {
@@ -221,6 +246,7 @@ async fn upload(
     let rel = safe(&path).ok_or_else(|| StatusCode::BAD_REQUEST.into_response())?;
     let key = rel.to_string_lossy().to_string();
     let dest = app.data.join("files").join(&user.name).join(&rel);
+    let expected = if_version(&headers)?;
 
     let limit = available(&app, &user, &dest).await?;
     if let (Some(limit), Some(length)) = (limit, content_length(&headers)) {
@@ -239,6 +265,24 @@ async fn upload(
         }
     };
 
+    // De aici pana la commit, indexul utilizatorului este blocat pentru alte scrieri.
+    let mut tx = match index::begin(&app.pool, user.id).await {
+        Ok(tx) => tx,
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(internal(e));
+        }
+    };
+    if let Some(expected) = expected {
+        let current = index::live_version(&mut tx, user.id, &key)
+            .await
+            .map_err(internal)?
+            .unwrap_or(0);
+        if current != expected {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(version_mismatch(current));
+        }
+    }
     if let Some(parent) = dest.parent() {
         tokio::fs::create_dir_all(parent).await.map_err(internal)?;
     }
@@ -249,11 +293,13 @@ async fn upload(
     }
     // In index trecem data pe care o are fisierul pe disc.
     let on_disk = mtime.unwrap_or_else(|| index::disk_mtime(&dest));
-    index::put_file(&app.pool, user.id, &key, size, &hash, on_disk)
+    let version = index::record_file(&mut tx, user.id, &key, size, &hash, on_disk)
         .await
         .map_err(internal)?;
+    tx.commit().await.map_err(internal)?;
 
     let mut resp = format!("{hash} {size}\n").into_response();
+    resp.headers_mut().insert("x-filesync-version", HeaderValue::from(version));
     if mtime.is_some() {
         resp.headers_mut()
             .insert("x-oc-mtime", HeaderValue::from_static("accepted"));
@@ -284,18 +330,60 @@ async fn remove(
     let rel = safe(&path).ok_or_else(|| StatusCode::BAD_REQUEST.into_response())?;
     let root = app.data.join("files").join(&user.name);
     let target = root.join(&rel);
+    let key = rel.to_string_lossy().to_string();
+    let expected = if_version(&headers)?;
+    let only_empty = headers.get("x-filesync-only-empty").is_some();
+
+    let mut tx = index::begin(&app.pool, user.id).await.map_err(internal)?;
     let meta = tokio::fs::symlink_metadata(&target)
         .await
         .map_err(|_| StatusCode::NOT_FOUND.into_response())?;
     if meta.is_dir() {
-        tokio::fs::remove_dir_all(&target).await.map_err(internal)?;
+        if only_empty {
+            // Clientul de sincronizare sterge un director doar daca este gol si pe server.
+            tokio::fs::remove_dir(&target).await.map_err(|_| {
+                text(StatusCode::CONFLICT, "Directorul nu este gol.")
+            })?;
+        } else {
+            tokio::fs::remove_dir_all(&target).await.map_err(internal)?;
+        }
     } else {
+        if let Some(expected) = expected {
+            let current = index::live_version(&mut tx, user.id, &key)
+                .await
+                .map_err(internal)?
+                .unwrap_or(0);
+            if current != expected {
+                return Err(version_mismatch(current));
+            }
+        }
         tokio::fs::remove_file(&target).await.map_err(internal)?;
     }
-    index::sync(&app.pool, &root, user.id, &rel.to_string_lossy())
+    tx.commit().await.map_err(internal)?;
+    index::sync(&app.pool, &root, user.id, &key)
         .await
         .map_err(internal)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Creeaza un director (cu parintii lui). Folosit de clientul de sincronizare.
+async fn make_dir(
+    State(app): State<App>,
+    Path(path): Path<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode, Response> {
+    let user = auth(&app, &headers).await?;
+    let rel = safe(path.trim_end_matches('/')).ok_or_else(|| StatusCode::BAD_REQUEST.into_response())?;
+    let root = app.data.join("files").join(&user.name);
+    let target = root.join(&rel);
+    let existed = tokio::fs::metadata(&target).await.map(|m| m.is_dir()).unwrap_or(false);
+    tokio::fs::create_dir_all(&target)
+        .await
+        .map_err(|_| text(StatusCode::CONFLICT, "Exista deja un fisier cu acest nume."))?;
+    index::sync(&app.pool, &root, user.id, &rel.to_string_lossy())
+        .await
+        .map_err(internal)?;
+    Ok(if existed { StatusCode::OK } else { StatusCode::CREATED })
 }
 
 #[derive(serde::Deserialize)]

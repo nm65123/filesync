@@ -99,11 +99,14 @@ async fn start() -> Result<(), Box<dyn std::error::Error>> {
         .locksystem(FakeLs::new())
         .strip_prefix("/dav")
         .build_handler();
+    // Calculatoarele instaleaza certificatul autoritatii, daca exista una.
+    let ca = data.join("tls/ca.pem");
+    let offered = if ca.exists() { ca } else { cert.clone() };
     let app = http::router(http::App {
         pool,
         data,
         dav,
-        cert: tls.then(|| cert.clone()),
+        cert: tls.then_some(offered),
         tls,
         public_url: std::env::var("FILESYNC_URL")
             .ok()

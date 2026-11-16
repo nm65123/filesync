@@ -360,7 +360,10 @@ async fn list_users(pool: &PgPool) -> Res<()> {
     Ok(())
 }
 
-/// Certificat self-signed pentru numele si adresele IP date, cu ajutorul `openssl`.
+/// Certificate pentru HTTPS fara autoritate publica, facute cu `openssl`:
+/// o autoritate proprie (CA), pe care calculatoarele o instaleaza o singura data,
+/// si certificatul serverului, semnat de ea. Rularea din nou pastreaza autoritatea,
+/// deci calculatoarele nu trebuie sa reinstaleze nimic.
 fn gencert(data: &Path, args: &[String]) -> Res<()> {
     let force = args.iter().any(|a| a == "--force");
     let names: Vec<&String> = args.iter().filter(|a| *a != "--force").collect();
@@ -369,17 +372,52 @@ fn gencert(data: &Path, args: &[String]) -> Res<()> {
     }
     let dir = data.join("tls");
     std::fs::create_dir_all(&dir)?;
-    let cert = dir.join("cert.pem");
-    let key = dir.join("key.pem");
-    if cert.exists() && !force {
+    let (ca, ca_key) = (dir.join("ca.pem"), dir.join("ca-key.pem"));
+    let (cert, key) = (dir.join("cert.pem"), dir.join("key.pem"));
+    let have_ca = ca.exists() && ca_key.exists();
+
+    if cert.exists() && !have_ca && !force {
         return Err(format!(
-            "exista deja un certificat: {}\n\
-             Unul nou il inlocuieste, iar toate calculatoarele care l-au instalat pe cel \
-             actual vor trebui sa il instaleze pe cel nou. Daca asta vrei, adauga --force.",
+            "exista un certificat de tip vechi: {}\n\
+             Cel nou il inlocuieste, iar calculatoarele care l-au instalat vor trebui sa \
+             instaleze o data certificatul nou. Daca asta vrei, adauga --force.",
             cert.display()
         )
         .into());
     }
+
+    let openssl = |arguments: &[&std::ffi::OsStr]| -> Res<()> {
+        let status = std::process::Command::new("openssl")
+            .args(arguments)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map_err(|e| format!("nu pot rula openssl (este instalat?): {e}"))?;
+        if !status.success() {
+            return Err("openssl a esuat".into());
+        }
+        Ok(())
+    };
+    let os = std::ffi::OsStr::new;
+    let ec = ["-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes"].map(os);
+
+    // 1. Autoritatea, doar daca nu exista (sau la --force).
+    if !have_ca || force {
+        let mut arguments = vec![os("req"), os("-x509")];
+        arguments.extend(ec);
+        let subject = format!("/CN=filesync CA {}", names[0]);
+        arguments.extend([
+            os("-days"), os("3650"),
+            os("-subj"), os(&subject),
+            os("-addext"), os("basicConstraints=critical,CA:TRUE,pathlen:0"),
+            os("-addext"), os("keyUsage=critical,keyCertSign,cRLSign"),
+            os("-keyout"), ca_key.as_os_str(),
+            os("-out"), ca.as_os_str(),
+        ]);
+        openssl(&arguments)?;
+    }
+
+    // 2. Certificatul serverului, semnat de autoritate.
     let san = names
         .iter()
         .map(|n| match n.parse::<std::net::IpAddr>() {
@@ -388,38 +426,50 @@ fn gencert(data: &Path, args: &[String]) -> Res<()> {
         })
         .collect::<Vec<_>>()
         .join(",");
-
-    let status = std::process::Command::new("openssl")
-        .args(["req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1"])
-        .args(["-nodes", "-days", "825", "-subj"])
-        .arg(format!("/CN={}", names[0]))
-        .arg("-addext")
-        .arg(format!("subjectAltName={san}"))
-        .arg("-addext")
-        .arg("extendedKeyUsage=serverAuth")
-        .arg("-keyout")
-        .arg(&key)
-        .arg("-out")
-        .arg(&cert)
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_err(|e| format!("nu pot rula openssl (este instalat?): {e}"))?;
-    if !status.success() {
-        return Err("openssl a esuat".into());
+    let (request, extensions, signed) = (dir.join("server.csr"), dir.join("server.ext"), dir.join("server.pem"));
+    std::fs::write(
+        &extensions,
+        format!(
+            "subjectAltName={san}\nbasicConstraints=critical,CA:FALSE\n\
+             keyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\n"
+        ),
+    )?;
+    let mut arguments = vec![os("req"), os("-new")];
+    arguments.extend(ec);
+    let subject = format!("/CN={}", names[0]);
+    arguments.extend([os("-subj"), os(&subject), os("-keyout"), key.as_os_str(), os("-out"), request.as_os_str()]);
+    openssl(&arguments)?;
+    openssl(&[
+        os("x509"), os("-req"), os("-in"), request.as_os_str(),
+        os("-CA"), ca.as_os_str(), os("-CAkey"), ca_key.as_os_str(), os("-CAcreateserial"),
+        os("-days"), os("825"), os("-extfile"), extensions.as_os_str(),
+        os("-out"), signed.as_os_str(),
+    ])?;
+    // Serverul trimite certificatul lui urmat de cel al autoritatii.
+    let mut chain = std::fs::read(&signed)?;
+    chain.extend(std::fs::read(&ca)?);
+    std::fs::write(&cert, chain)?;
+    for leftover in [&request, &extensions, &signed, &dir.join("ca.srl")] {
+        let _ = std::fs::remove_file(leftover);
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600))?;
+        for secret in [&key, &ca_key] {
+            std::fs::set_permissions(secret, std::fs::Permissions::from_mode(0o600))?;
+        }
     }
 
-    println!("certificat: {}", cert.display());
-    println!("cheie:      {}", key.display());
-    println!("valabil pentru: {san} (825 de zile)");
+    println!("certificatul serverului: {} ({san}, 825 de zile)", cert.display());
+    println!("certificatul de instalat pe calculatoare: {}", ca.display());
+    println!("amprenta lui, de comparat la instalare:");
     let _ = std::process::Command::new("openssl")
         .args(["x509", "-noout", "-fingerprint", "-sha256", "-in"])
-        .arg(&cert)
+        .arg(&ca)
         .status();
-    println!("Serverul il foloseste automat la urmatoarea pornire.");
+    if have_ca && !force {
+        println!("Autoritatea a ramas aceeasi: calculatoarele nu trebuie sa reinstaleze nimic.");
+    }
+    println!("Reporneste serverul ca sa foloseasca certificatul nou.");
     Ok(())
 }

@@ -12,6 +12,8 @@ Files only: no calendar, no contacts, no office suite.
 - Built-in HTTPS with a self-signed certificate. It works with a bare IP
   address; no domain name is needed.
 - Original file dates are kept when the client sends them (rclone does).
+- A sync client (`filesync-client`) keeps a local directory identical with
+  the server, in both directions.
 - Public share links for a file or a directory, optionally with a password
   and an expiry date.
 - Every file and directory is indexed in PostgreSQL (size, BLAKE3 hash, date,
@@ -21,9 +23,10 @@ Files only: no calendar, no contacts, no office suite.
 Contents: [1. Install the server](#1-install-the-server) ·
 [2. Manage users](#2-manage-users) ·
 [3. Connect a computer](#3-connect-a-computer) ·
-[4. Update](#4-update) ·
-[5. Settings](#5-settings) ·
-[6. Known limitations](#6-known-limitations)
+[4. Sync client](#4-sync-client) ·
+[5. Update](#5-update) ·
+[6. Settings](#6-settings) ·
+[7. Known limitations](#7-known-limitations)
 
 ---
 
@@ -85,12 +88,18 @@ runuser -u filesync -- env FILESYNC_DATA=/var/lib/filesync \
     filesync gencert 192.168.0.48
 ```
 
-For example `filesync gencert 192.168.0.48 files.example.org`. The command
-prints the certificate's **SHA-256 fingerprint**. Write it down: you need it
-in step 3.1. The certificate is valid for 825 days. To renew it, run the same
-command with `--force` added and restart the service. A new certificate
-replaces the old one, so every computer has to repeat step 3.1; that is why
-the command refuses to overwrite an existing certificate without `--force`.
+For example `filesync gencert 192.168.0.48 files.example.org`.
+
+The command creates two things: a small certificate authority of your own,
+and the server's certificate, signed by it. Computers install the
+authority's certificate once (step 3.1). The command prints its **SHA-256
+fingerprint**. Write it down: you need it in step 3.1.
+
+The server's certificate is valid for 825 days. To renew it, or to add a
+name or an address, run the same command again and restart the service. The
+authority stays the same, so the computers do not have to do anything.
+(`--force` replaces the authority too; then every computer has to repeat
+step 3.1.)
 
 ### 1.6 Start it as a service
 
@@ -175,10 +184,11 @@ When an upload would exceed the quota the server refuses it with
 
 ### 3.1 Trust the certificate (once per computer)
 
-A self-signed certificate is unknown to other computers, so each one has to
-be told to trust it. Download it, check that its fingerprint is the one
-printed in step 1.5, then install it. **If the fingerprints differ, stop:**
-the file is not your server's certificate.
+The server's certificate is signed by its own authority, which other
+computers do not know, so each one has to be told to trust it. Download the
+authority's certificate, check that its fingerprint is the one printed in
+step 1.5, then install it. **If the fingerprints differ, stop:** the file is
+not your server's certificate.
 
 **Windows** (PowerShell opened as administrator):
 
@@ -211,7 +221,7 @@ sudo security add-trusted-cert -d -r trustRoot \
 To see the fingerprint again on the server:
 
 ```sh
-openssl x509 -in /var/lib/filesync/tls/cert.pem -noout -fingerprint -sha256
+openssl x509 -in /var/lib/filesync/tls/ca.pem -noout -fingerprint -sha256
 ```
 
 ### 3.2 Copy files with rclone (keeps the original dates)
@@ -242,6 +252,10 @@ curl -u alice:TOKEN -X DELETE https://192.168.0.48:8443/files/docs/report.pdf
 
 Add `-H "X-OC-Mtime: <unix seconds>"` on upload to set the file's date.
 `DELETE` also removes a directory with everything in it.
+
+Sync clients can make a write conditional with `X-Filesync-If-Version: N`:
+the server answers `412` when the file's current version is not `N` (`0`
+means "must not exist yet"). `PUT /api/dirs/<path>` creates a directory.
 
 ### 3.5 Change feed (for sync clients)
 
@@ -313,7 +327,84 @@ address so the links are printed correctly.
 
 ---
 
-## 4. Update
+## 4. Sync client
+
+`filesync-client` keeps one local directory identical with a user's space on
+the server. Files stay real files on both sides.
+
+### 4.1 Build
+
+On Linux, in the directory of the source code:
+
+```sh
+cargo build --release -p filesync-client
+install -m 755 target/release/filesync-client /usr/local/bin/filesync-client
+```
+
+On Windows, install Rust from <https://rustup.rs> (the installer also offers
+the Microsoft C++ build tools it needs) and Git from <https://git-scm.com>,
+then in PowerShell:
+
+```powershell
+git clone https://github.com/nm65123/filesync.git
+cd filesync
+cargo build --release -p filesync-client
+```
+
+The program is `target\release\filesync-client.exe`; copy it wherever you
+like. The Windows build has not been tested yet.
+
+### 4.2 Connect
+
+You need the server's address, a user name, an app token
+(`filesync addtoken alice` on the server) and, for a server with its own
+certificate authority, the certificate file from step 3.1.
+
+```sh
+filesync-client setup --url https://192.168.0.48:8443 --user alice \
+    --dir ~/Files --ca-cert filesync.crt
+```
+
+It asks for the token, checks the connection and remembers everything. The
+client uses the certificate file you give it; it does not look at the
+certificates installed in the operating system. Leave `--ca-cert` out when
+the server has a certificate from a public authority.
+
+### 4.3 Run
+
+```sh
+filesync-client run          # keeps syncing every 10 seconds; Ctrl+C stops
+filesync-client once         # one sync, then exit
+filesync-client status
+```
+
+`--interval N` changes the pause. `--profile NAME` (on every command) lets
+one computer sync several directories or accounts.
+
+### 4.4 What it does
+
+- New and changed files travel in both directions, with their original
+  dates. Every download is verified against the server's hash.
+- A file changed on both sides since the last sync is a **conflict**:
+  nothing is lost. The server's version keeps the name, and the local one is
+  kept as `name (conflict 2026-11-16 computer).ext` and uploaded too.
+- Deletions travel in both directions. A file changed on one side wins over
+  its deletion on the other.
+- If more than 50 entries and more than half of everything would be deleted
+  from the server in one go, the client stops and asks you to confirm with
+  `--allow-mass-delete`. If the local directory is missing (a disk that is
+  not mounted), it does nothing.
+- Temporary and system files are not synced: `~$*`, `.~lock.*`, `*.tmp`,
+  `*.part`, `*.crdownload`, `Thumbs.db`, `desktop.ini`, `.DS_Store`.
+- A file that is still being written is left for the next round.
+
+Settings and the sync state are kept in `~/.config/filesync-client/` (Linux,
+macOS) or `%APPDATA%\filesync-client\` (Windows). The token is stored there
+in plain text, readable only by your user.
+
+---
+
+## 5. Update
 
 ```sh
 cd filesync
@@ -323,11 +414,12 @@ install -m 755 target/release/filesync /usr/local/bin/filesync
 systemctl restart filesync
 ```
 
-Database changes are applied automatically at start.
+Database changes are applied automatically at start. Rebuild the client the
+same way (step 4.1) on the computers that use it.
 
 ---
 
-## 5. Settings
+## 6. Settings
 
 Set in `/etc/filesync.env`; restart the service after a change.
 
@@ -365,7 +457,7 @@ Back up the data directory and the database together.
 
 ---
 
-## 6. Known limitations
+## 7. Known limitations
 
 - The disk is the source of truth and the index follows it. Files put
   directly into the data directory (not through the server) are not seen
@@ -373,13 +465,17 @@ Back up the data directory and the database together.
 - A file uploaded through WebDAV is read once more after the upload, to
   compute its hash.
 - WebDAV `COPY` is not checked against the quota.
+- Sync client: it finds local changes by scanning the directory at every
+  round (no file-system notifications yet); files are real files (no virtual
+  files yet); only one client per profile may run at a time; names that
+  differ only in letter case are not handled on Windows and macOS.
 - Share links: wrong passwords are not rate-limited, and a shared directory
   cannot be downloaded as a single archive.
 - The group and administrator flag are stored but not used yet.
 - Server messages are in Romanian.
 
-Planned: delta transfers (rsync algorithm), desktop client with virtual
-files.
+Planned: virtual files in the client (Windows Cloud Files, FUSE), delta
+transfers (rsync algorithm).
 
 ## License
 

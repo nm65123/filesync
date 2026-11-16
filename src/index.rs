@@ -42,7 +42,8 @@ const UPSERT: &str = "
     VALUES ($1, $2, $3, $4, $5, to_timestamp($6), nextval('files_seq'))
     ON CONFLICT (owner, path) DO UPDATE
     SET is_dir = $3, size = $4, hash = $5, modified = to_timestamp($6),
-        version = files.version + 1, seq = nextval('files_seq'), deleted = false";
+        version = files.version + 1, seq = nextval('files_seq'), deleted = false
+    RETURNING version";
 
 /// Directoarele parinte ale unei cai: "a/b/c.txt" -> ["a", "a/b"].
 fn parents(path: &str) -> Vec<&str> {
@@ -105,31 +106,50 @@ fn walk(root: &Path, rel: &str, found: &mut HashMap<String, OnDisk>) {
     }
 }
 
-/// Inregistreaza un fisier scris prin API (hash-ul este deja cunoscut).
-pub async fn put_file(
-    pool: &PgPool,
+pub type Tx = sqlx::Transaction<'static, sqlx::Postgres>;
+
+/// Incepe o scriere in indexul unui utilizator. Cat timp tranzactia este deschisa,
+/// nimeni altcineva nu scrie in indexul lui.
+pub async fn begin(pool: &PgPool, owner: i32) -> Res<Tx> {
+    let mut tx = pool.begin().await?;
+    lock(&mut tx, owner).await?;
+    Ok(tx)
+}
+
+/// Versiunea curenta a unei cai; None daca nu exista (sau a fost stearsa).
+pub async fn live_version(tx: &mut Tx, owner: i32, path: &str) -> Res<Option<i64>> {
+    let row = sqlx::query_as::<_, (i64,)>(
+        "SELECT version FROM files WHERE owner = $1 AND path = $2 AND NOT deleted",
+    )
+    .bind(owner)
+    .bind(path)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(row.map(|(version,)| version))
+}
+
+/// Inregistreaza un fisier scris prin API (hash-ul este deja cunoscut). Intoarce versiunea.
+pub async fn record_file(
+    tx: &mut Tx,
     owner: i32,
     path: &str,
     size: i64,
     hash: &str,
     mtime: i64,
-) -> Res<()> {
-    let mut tx = pool.begin().await?;
-    lock(&mut tx, owner).await?;
+) -> Res<i64> {
     for dir in parents(path) {
-        ensure_dir(&mut tx, owner, dir).await?;
+        ensure_dir(tx, owner, dir).await?;
     }
-    sqlx::query(UPSERT)
+    let (version,) = sqlx::query_as::<_, (i64,)>(UPSERT)
         .bind(owner)
         .bind(path)
         .bind(false)
         .bind(size)
         .bind(hash)
         .bind(mtime as f64)
-        .execute(&mut *tx)
+        .fetch_one(&mut **tx)
         .await?;
-    tx.commit().await?;
-    Ok(())
+    Ok(version)
 }
 
 /// Scrierile in index ale unui utilizator se fac pe rand, ca ordinea `seq` sa fie

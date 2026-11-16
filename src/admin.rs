@@ -1,4 +1,5 @@
-use crate::util::{dir_size, human, parse_size, random_hex, valid_name};
+use crate::index;
+use crate::util::{human, parse_size, random_hex, valid_name};
 use argon2::{
     password_hash::{rand_core::OsRng, PasswordHasher, SaltString},
     Argon2,
@@ -22,6 +23,7 @@ filesync enable <nume>            reactiveaza contul
 filesync addtoken <nume>          creeaza un token (parola de aplicatie)
 filesync tokens <nume>            listeaza tokenurile
 filesync deltoken <nume> <id|all> sterge un token sau pe toate
+filesync reindex [nume]           reface indexul dupa ce este pe disc
 filesync gencert <nume|ip>...     genereaza un certificat self-signed
 filesync help                     acest text";
 
@@ -79,7 +81,26 @@ pub async fn run(pool: &PgPool, data: &Path, args: &[String]) -> Res<bool> {
                 .await?;
             changed(done.rows_affected(), name)?;
         }
-        "users" => list_users(pool, data).await?,
+        "users" => list_users(pool).await?,
+        "reindex" => {
+            let only = args.get(1).map(String::as_str);
+            let users = sqlx::query_as::<_, (i32, String)>("SELECT id, name FROM users ORDER BY name")
+                .fetch_all(pool)
+                .await?;
+            if let Some(name) = only {
+                if !users.iter().any(|(_, n)| n == name) {
+                    return Err(format!("utilizator inexistent: {name}").into());
+                }
+            }
+            for (id, name) in users.into_iter().filter(|(_, n)| only.is_none_or(|o| o == n)) {
+                let root = data.join("files").join(&name);
+                let stats = index::sync(pool, &root, id, "").await.map_err(|e| e.to_string())?;
+                println!(
+                    "{name}: {} noi, {} modificate, {} disparute",
+                    stats.added, stats.updated, stats.removed
+                );
+            }
+        }
         "quota" => {
             let name = arg(args, 1, "numele")?;
             let quota = parse_size(arg(args, 2, "marimea (ex. 10G sau none)")?)
@@ -209,10 +230,12 @@ fn read_password(name: &str) -> Res<String> {
         .to_string())
 }
 
-async fn list_users(pool: &PgPool, data: &Path) -> Res<()> {
-    let rows = sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<i64>, bool, bool, i64)>(
+async fn list_users(pool: &PgPool) -> Res<()> {
+    let rows = sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<i64>, bool, bool, i64, i64)>(
         "SELECT u.name, u.email, u.grp, u.quota, u.admin, u.active,
-                (SELECT count(*) FROM tokens t WHERE t.user_id = u.id)
+                (SELECT count(*) FROM tokens t WHERE t.user_id = u.id),
+                (SELECT COALESCE(SUM(f.size), 0)::bigint FROM files f
+                 WHERE f.owner = u.id AND NOT f.deleted)
          FROM users u ORDER BY u.name",
     )
     .fetch_all(pool)
@@ -221,14 +244,13 @@ async fn list_users(pool: &PgPool, data: &Path) -> Res<()> {
         "{:<20} {:<28} {:<12} {:>10} {:>10} {:<5} {:<6} {}",
         "NUME", "EMAIL", "GRUP", "FOLOSIT", "COTA", "ADMIN", "ACTIV", "TOKENURI"
     );
-    for (name, email, group, quota, admin, active, tokens) in rows {
-        let used = dir_size(&data.join("files").join(&name));
+    for (name, email, group, quota, admin, active, tokens, used) in rows {
         println!(
             "{:<20} {:<28} {:<12} {:>10} {:>10} {:<5} {:<6} {}",
             name,
             email.as_deref().unwrap_or("-"),
             group.as_deref().unwrap_or("-"),
-            human(used),
+            human(used as u64),
             quota.map(|q| human(q as u64)).unwrap_or_else(|| "nelimitat".into()),
             if admin { "da" } else { "nu" },
             if active { "da" } else { "nu" },

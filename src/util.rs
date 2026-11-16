@@ -31,21 +31,6 @@ pub fn set_mtime(path: &Path, secs: i64) -> std::io::Result<()> {
     std::fs::File::options().write(true).open(path)?.set_modified(when)
 }
 
-/// Spatiul ocupat de un director, in octeti (fara a urma legaturi simbolice).
-pub fn dir_size(path: &Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return 0;
-    };
-    let mut total = 0;
-    for entry in entries.flatten() {
-        match entry.file_type() {
-            Ok(t) if t.is_dir() => total += dir_size(&entry.path()),
-            Ok(t) if t.is_file() => total += entry.metadata().map(|m| m.len()).unwrap_or(0),
-            _ => {}
-        }
-    }
-    total
-}
 
 /// "10G", "500M", "1T", "2048" (octeti) sau "none". Intoarce None daca textul e invalid,
 /// Some(None) pentru nelimitat.

@@ -1,5 +1,6 @@
 mod admin;
 mod http;
+mod index;
 mod util;
 
 use dav_server::{fakels::FakeLs, DavHandler};
@@ -7,7 +8,7 @@ use sqlx::postgres::PgPoolOptions;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-const SCHEMA: [&str; 8] = [
+const SCHEMA: [&str; 14] = [
     "CREATE TABLE IF NOT EXISTS users (
         id       SERIAL PRIMARY KEY,
         name     TEXT NOT NULL UNIQUE,
@@ -33,6 +34,14 @@ const SCHEMA: [&str; 8] = [
         modified TIMESTAMPTZ NOT NULL DEFAULT now(),
         PRIMARY KEY (owner, path)
     )",
+    // Indexul: directoare, stergeri pastrate ca randuri, numar de ordine al modificarii
+    "ALTER TABLE files ADD COLUMN IF NOT EXISTS is_dir BOOLEAN NOT NULL DEFAULT false",
+    "ALTER TABLE files ADD COLUMN IF NOT EXISTS deleted BOOLEAN NOT NULL DEFAULT false",
+    "ALTER TABLE files ADD COLUMN IF NOT EXISTS seq BIGINT NOT NULL DEFAULT 0",
+    "CREATE SEQUENCE IF NOT EXISTS files_seq",
+    "CREATE INDEX IF NOT EXISTS files_owner_seq ON files (owner, seq)",
+    // Randurile dinaintea indexului primesc si ele un numar de ordine
+    "UPDATE files SET seq = nextval('files_seq') WHERE seq = 0",
 ];
 
 #[tokio::main]

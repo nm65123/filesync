@@ -12,6 +12,9 @@ Files only: no calendar, no contacts, no office suite.
 - Built-in HTTPS with a self-signed certificate. It works with a bare IP
   address; no domain name is needed.
 - Original file dates are kept when the client sends them (rclone does).
+- Every file and directory is indexed in PostgreSQL (size, BLAKE3 hash, date,
+  version). A change feed tells sync clients what changed since their last
+  visit.
 
 Contents: [1. Install the server](#1-install-the-server) ·
 [2. Manage users](#2-manage-users) ·
@@ -149,6 +152,7 @@ letters, digits, `.`, `-` and `_`.
 | `filesync disable alice`             | block the account (`enable` undoes)  |
 | `filesync tokens alice`              | list the account's tokens            |
 | `filesync deltoken alice ID`         | delete one token (`all` for all)     |
+| `filesync reindex [alice]`           | rebuild the index from the disk      |
 | `filesync help`                      | list all commands                    |
 
 Clients log in with the user name and either the password or, better, an
@@ -226,9 +230,42 @@ rclone when dates matter.
 ```sh
 curl -u alice:TOKEN -T report.pdf https://192.168.0.48:8443/files/docs/report.pdf
 curl -u alice:TOKEN https://192.168.0.48:8443/files/docs/report.pdf -o report.pdf
+curl -u alice:TOKEN -X DELETE https://192.168.0.48:8443/files/docs/report.pdf
 ```
 
 Add `-H "X-OC-Mtime: <unix seconds>"` on upload to set the file's date.
+`DELETE` also removes a directory with everything in it.
+
+### 3.5 Change feed (for sync clients)
+
+Every change gets a sequence number. A client remembers the last number it
+has seen (its cursor) and asks for everything after it:
+
+```sh
+curl -u alice:TOKEN "https://192.168.0.48:8443/api/changes?since=0"
+```
+
+```json
+{
+  "cursor": 12,
+  "more": false,
+  "entries": [
+    { "path": "docs", "dir": true, "size": 0, "hash": "", "mtime": 0,
+      "version": 1, "seq": 11, "deleted": false },
+    { "path": "docs/report.pdf", "dir": false, "size": 48213,
+      "hash": "c450580a...", "mtime": 1600000000,
+      "version": 1, "seq": 12, "deleted": false }
+  ]
+}
+```
+
+- `since=0` returns everything that exists. Send the returned `cursor` as
+  `since` next time to get only what changed in between.
+- `more: true` means there is more: ask again with the new cursor. `limit`
+  sets the page size (default 1000, maximum 10000).
+- A deleted file or directory appears with `"deleted": true`.
+- `hash` is the BLAKE3 hash of the content, `mtime` the file date in Unix
+  seconds, `version` counts the changes to that path.
 
 ---
 
@@ -277,21 +314,25 @@ Where things are:
 | `/etc/filesync.env`            | settings, database password     |
 | PostgreSQL database `filesync` | users, tokens, file index       |
 
+The index can always be rebuilt from the files with `filesync reindex`.
+
 Back up the data directory and the database together.
 
 ---
 
 ## 6. Known limitations
 
-- Files written through WebDAV are not yet recorded in the database index.
-- Quota usage is computed by scanning the user's directory, which is slow
-  with very many files.
+- The disk is the source of truth and the index follows it. Files put
+  directly into the data directory (not through the server) are not seen
+  until you run `filesync reindex`. Run it also after a crash or a restore.
+- A file uploaded through WebDAV is read once more after the upload, to
+  compute its hash.
 - WebDAV `COPY` is not checked against the quota.
 - The group and administrator flag are stored but not used yet.
 - Server messages are in Romanian.
 
-Planned: file index and change feed for sync clients, delta transfers
-(rsync algorithm), public share links, desktop client with virtual files.
+Planned: delta transfers (rsync algorithm), public share links, desktop
+client with virtual files.
 
 ## License
 

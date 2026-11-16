@@ -535,6 +535,8 @@ dependencies = [
  "blake3",
  "dav-server",
  "futures-util",
+ "percent-encoding",
+ "serde",
  "sqlx",
  "tokio",
  "tokio-util",

@@ -1,6 +1,8 @@
 //! filesync-client: tine un director local la fel cu spatiul unui utilizator de pe server.
 
 mod api;
+#[cfg(unix)]
+mod mount;
 mod scan;
 mod state;
 mod sync;
@@ -34,6 +36,9 @@ filesync-client once             o sincronizare, apoi se opreste
 filesync-client run [--interval SECUNDE]
                                  sincronizeaza continuu (implicit la 10 secunde)
 filesync-client status           arata configuratia si ce stie clientul
+filesync-client mount DIRECTOR [--cache-size 5G]
+                                 (Linux, macOS) disc virtual: fisierele apar fara sa ocupe
+                                 spatiu si sunt aduse la deschidere
 filesync-client autostart on|off
                                  (Windows) porneste clientul singur, in fundal, la autentificare
 
@@ -47,8 +52,33 @@ struct Config {
     url: String,
     user: String,
     token: String,
-    dir: PathBuf,
+    /// Directorul sincronizat; lipseste la un profil folosit doar ca disc virtual.
+    #[serde(default)]
+    dir: Option<PathBuf>,
     ca_cert: Option<PathBuf>,
+}
+
+impl Config {
+    fn sync_dir(&self) -> Res<&Path> {
+        self.dir.as_deref().ok_or_else(|| {
+            "acest profil nu are un director de sincronizat (a fost facut fara --dir)".to_string()
+        })
+    }
+}
+
+/// "5G", "500M", "2T" sau un numar de octeti.
+fn parse_size(text: &str) -> Option<u64> {
+    let t = text.trim().to_ascii_lowercase();
+    let t = t.trim_end_matches("ib").trim_end_matches('b');
+    let (number, factor) = match t.chars().last()? {
+        'k' => (&t[..t.len() - 1], 1u64 << 10),
+        'm' => (&t[..t.len() - 1], 1u64 << 20),
+        'g' => (&t[..t.len() - 1], 1u64 << 30),
+        't' => (&t[..t.len() - 1], 1u64 << 40),
+        _ => (t, 1),
+    };
+    let value: f64 = number.trim().parse().ok()?;
+    (value.is_finite() && value >= 0.0).then(|| (value * factor as f64) as u64)
 }
 
 /// Unde isi tine clientul configuratia si starea.
@@ -155,7 +185,7 @@ fn setup(home: &Path, args: &[String]) -> Res<()> {
     let need = |name: &str| option(args, name).ok_or(format!("lipseste {name}\n\n{HELP}"));
     let url = need("--url")?;
     let user = need("--user")?;
-    let dir = PathBuf::from(need("--dir")?);
+    let dir = option(args, "--dir").map(PathBuf::from);
     if !url.starts_with("https://") && !url.starts_with("http://127.0.0.1") && !url.starts_with("http://localhost") {
         return Err("adresa trebuie sa inceapa cu https:// (tokenul nu se trimite necriptat)".into());
     }
@@ -186,8 +216,13 @@ fn setup(home: &Path, args: &[String]) -> Res<()> {
     let api = api::Api::new(&url, &user, &token, ca_cert.as_deref())?;
     api.changes(i64::MAX).map_err(|e| format!("nu ma pot conecta la server: {e}"))?;
 
-    std::fs::create_dir_all(&dir).map_err(|e| format!("nu pot crea {}: {e}", dir.display()))?;
-    let dir = dir.canonicalize().map_err(|e| e.to_string())?;
+    let dir = match dir {
+        Some(dir) => {
+            std::fs::create_dir_all(&dir).map_err(|e| format!("nu pot crea {}: {e}", dir.display()))?;
+            Some(dir.canonicalize().map_err(|e| e.to_string())?)
+        }
+        None => None,
+    };
     let config = Config { url, user, token, dir, ca_cert };
     let path = home.join("config.json");
     std::fs::write(&path, serde_json::to_vec_pretty(&config).map_err(|e| e.to_string())?)
@@ -198,8 +233,13 @@ fn setup(home: &Path, args: &[String]) -> Res<()> {
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
     }
     println!("Conectat la {} ca {}.", config.url, config.user);
-    println!("Director sincronizat: {}", config.dir.display());
-    println!("Porneste cu: filesync-client run");
+    match &config.dir {
+        Some(dir) => {
+            println!("Director sincronizat: {}", dir.display());
+            println!("Porneste cu: filesync-client run");
+        }
+        None => println!("Profil fara director sincronizat. Foloseste: filesync-client mount DIRECTOR"),
+    }
     Ok(())
 }
 
@@ -210,7 +250,7 @@ fn sync(home: &Path, config: &Config, api: &api::Api, options: &sync::Options) -
     let mut total = sync::Report::default();
     for _ in 0..5 {
         let mut log = |line: String| out(&line);
-        let result = sync::sync_once(api, &config.dir, &mut state, options, &mut log);
+        let result = sync::sync_once(api, config.sync_dir()?, &mut state, options, &mut log);
         state.save(&state_path)?; // si ce s-a facut pana la o eroare ramane tinut minte
         let report = result?;
         total.uploaded += report.uploaded;
@@ -296,7 +336,7 @@ fn start() -> Res<()> {
             let interval = option(&args, "--interval").and_then(|v| v.parse::<u64>().ok()).unwrap_or(10).max(1);
             out(&format!(
                 "Sincronizez {} cu {} la fiecare {interval} secunde.",
-                config.dir.display(),
+                config.sync_dir()?.display(),
                 config.url
             ));
             let mut last_error = String::new();
@@ -323,9 +363,33 @@ fn start() -> Res<()> {
             let state = state::State::load(&home.join("state.json"))?;
             println!("server:     {}", config.url);
             println!("utilizator: {}", config.user);
-            println!("director:   {}", config.dir.display());
+            match &config.dir {
+                Some(dir) => println!("director:   {}", dir.display()),
+                None => println!("director:   (niciunul; profil pentru disc virtual)"),
+            }
             println!("cunoscute:  {} fisiere si directoare (cursor {})", state.files.len(), state.cursor);
             Ok(())
+        }
+        "mount" => {
+            #[cfg(unix)]
+            {
+                let target = args
+                    .get(1)
+                    .filter(|a| !a.starts_with("--"))
+                    .ok_or("lipseste directorul in care sa montez")?;
+                let limit = match option(&args, "--cache-size") {
+                    Some(text) => parse_size(&text).ok_or("--cache-size: foloseste 5G, 500M...")?,
+                    None => 5 << 30,
+                };
+                let (_, api) = load(&home)?;
+                let _guard = lock(&home)?;
+                mount::mount(api, &home, Path::new(target), limit, options.host.clone(), out)
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = parse_size;
+                Err("mount este pentru Linux si macOS. Pe Windows fisierele virtuale vor folosi alt mecanism.".into())
+            }
         }
         "help" | "--help" | "-h" => {
             println!("{HELP}");

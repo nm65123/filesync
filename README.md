@@ -14,6 +14,8 @@ Files only: no calendar, no contacts, no office suite.
 - Original file dates are kept when the client sends them (rclone does).
 - A sync client (`filesync-client`) keeps a local directory identical with
   the server, in both directions.
+- On Linux and macOS the client can also mount the server as a virtual
+  drive: files take no local space and are fetched when opened.
 - Public share links for a file or a directory, optionally with a password
   and an expiry date.
 - Every file and directory is indexed in PostgreSQL (size, BLAKE3 hash, date,
@@ -256,6 +258,7 @@ Add `-H "X-OC-Mtime: <unix seconds>"` on upload to set the file's date.
 Sync clients can make a write conditional with `X-Filesync-If-Version: N`:
 the server answers `412` when the file's current version is not `N` (`0`
 means "must not exist yet"). `PUT /api/dirs/<path>` creates a directory.
+`POST /api/move` with `{"from": "a/b", "to": "c/d"}` moves or renames.
 
 ### 3.5 Change feed (for sync clients)
 
@@ -352,7 +355,11 @@ cargo build --release -p filesync-client
 ```
 
 The program is `target\release\filesync-client.exe`; copy it wherever you
-like. The Windows build has not been tested yet.
+like.
+
+On macOS, install Rust from <https://rustup.rs>, then build as on Linux. For
+the virtual drive (4.6) install macFUSE and `pkgconf` first; without them
+the build fails.
 
 ### 4.2 Before you connect: certificate and token
 
@@ -481,6 +488,67 @@ Settings and the sync state are kept in `~/.config/filesync-client/` (Linux,
 macOS) or `%APPDATA%\filesync-client\` (Windows). The token is stored there
 in plain text, readable only by your user.
 
+### 4.6 Virtual drive (Linux and macOS)
+
+Instead of keeping a full copy, the client can show the server as a mounted
+directory. Files appear with their names, sizes and dates but take no local
+space; a file is downloaded the first time it is opened and kept in a local
+cache of limited size.
+
+**Requirements.**
+
+- Linux: `apt install fuse3`.
+- macOS: [macFUSE](https://macfuse.github.io) and `pkgconf`:
+
+  ```sh
+  brew install --cask macfuse
+  brew install pkgconf
+  ```
+
+  macOS asks you to allow the macFUSE system extension in *System Settings →
+  Privacy & Security*, then to restart. Build the client after that (4.1).
+  If the build cannot find `fuse`, run
+  `export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig` and build again.
+
+**Connect** a profile without `--dir` (certificate and token as in 4.2):
+
+```sh
+filesync-client setup --profile drive --url https://192.168.0.48:8443 \
+    --user alice --ca-cert filesync.crt
+```
+
+**Mount:**
+
+```sh
+filesync-client mount ~/Filesync --profile drive
+```
+
+The directory shows the server's content while the program runs; Ctrl+C (or
+`umount ~/Filesync`) unmounts it. `--cache-size 20G` sets the cache limit
+(default 5G); the least recently used files are dropped first. `--log FILE`
+writes the messages to a file.
+
+How it behaves:
+
+- Listing a directory downloads nothing.
+- Opening a file downloads it once, whole, and verifies its hash. Large
+  files therefore take a moment the first time.
+- Saving a file uploads it when the program closes it. If the upload fails,
+  the program that saved gets an error, the data stays on your disk, and the
+  client retries every 20 seconds.
+- New, changed and deleted files on the server show up within a few seconds.
+- If a file was changed on the server while you were editing it, your
+  version is uploaded as `name (conflict date computer).ext` and the name
+  keeps the server's version.
+- Temporary files of editors (`~$*`, `*.tmp`, `.DS_Store`...) stay local and
+  are never uploaded. A temporary file renamed to its final name (the way
+  many editors save) is uploaded under the final name.
+- Without a connection you still see the list and can open cached files;
+  other files cannot be opened until the server is back.
+
+Use a different profile for the drive than for a synced directory. The
+virtual drive has been tested on Linux only so far.
+
 ---
 
 ## 5. Update
@@ -545,16 +613,19 @@ Back up the data directory and the database together.
   compute its hash.
 - WebDAV `COPY` is not checked against the quota.
 - Sync client: it finds local changes by scanning the directory at every
-  round (no file-system notifications yet); files are real files (no virtual
-  files yet); only one client per profile may run at a time; names that
-  differ only in letter case are not handled on Windows and macOS.
+  round (no file-system notifications yet); only one client per profile may
+  run at a time; names that differ only in letter case are not handled on
+  Windows and macOS.
+- Virtual drive: Linux and macOS only (Windows is planned); a file is
+  downloaded whole before it can be read; the reported free space is not the
+  real quota.
 - Share links: wrong passwords are not rate-limited, and a shared directory
   cannot be downloaded as a single archive.
 - The group and administrator flag are stored but not used yet.
 - Server messages are in Romanian.
 
-Planned: virtual files in the client (Windows Cloud Files, FUSE), delta
-transfers (rsync algorithm).
+Planned: virtual files on Windows (Cloud Files API), delta transfers (rsync
+algorithm).
 
 ## License
 

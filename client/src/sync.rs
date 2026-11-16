@@ -74,7 +74,7 @@ enum Step {
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-fn now() -> i64 {
+pub fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -89,7 +89,7 @@ pub fn timestamp() -> String {
 }
 
 /// "2026-11-16" din secunde Unix (UTC).
-fn date(secs: i64) -> String {
+pub fn date(secs: i64) -> String {
     let z = secs.div_euclid(86_400) + 719_468;
     let (era, doe) = (z.div_euclid(146_097), z.rem_euclid(146_097));
     let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;

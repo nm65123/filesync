@@ -222,6 +222,23 @@ impl Api {
         }
     }
 
+    /// Muta sau redenumeste pe server (un fisier existent la destinatie este inlocuit).
+    pub fn rename(&self, from: &str, to: &str) -> Result<(), Fail> {
+        let url = format!("{}/api/move", self.base);
+        let body = serde_json::json!({ "from": from, "to": to }).to_string();
+        let response = self
+            .agent
+            .post(&url)
+            .header("Authorization", &self.auth)
+            .header("Content-Type", "application/json")
+            .send(body)
+            .map_err(network)?;
+        if !response.status().is_success() {
+            return Err(Self::refused(response));
+        }
+        Ok(())
+    }
+
     pub fn mkdir(&self, path: &str) -> Result<(), Fail> {
         let url = format!("{}/api/dirs/{}", self.base, encode(path));
         let response = self

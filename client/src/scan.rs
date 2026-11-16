@@ -18,6 +18,7 @@ pub fn ignored(name: &str) -> bool {
     let lower = name.to_lowercase();
     name.starts_with(TEMP_PREFIX)
         || name.starts_with("~$")
+        || name.starts_with("._")
         || name.starts_with(".~lock.")
         || lower.ends_with(".tmp")
         || lower.ends_with(".part")

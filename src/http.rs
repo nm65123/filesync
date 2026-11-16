@@ -43,6 +43,7 @@ pub fn router(app: App) -> Router {
         .route("/files/{*path}", get(download).put(upload).delete(remove))
         .route("/api/changes", get(changes))
         .route("/api/dirs/{*path}", axum::routing::put(make_dir))
+        .route("/api/move", axum::routing::post(move_path))
         .route("/dav", any(dav_root))
         .route("/dav/", any(dav_root))
         .route("/dav/{*path}", any(dav_path))
@@ -384,6 +385,45 @@ async fn make_dir(
         .await
         .map_err(internal)?;
     Ok(if existed { StatusCode::OK } else { StatusCode::CREATED })
+}
+
+#[derive(serde::Deserialize)]
+struct MoveRequest {
+    from: String,
+    to: String,
+}
+
+/// Muta sau redenumeste un fisier ori un director. Un fisier existent la destinatie
+/// este inlocuit; un director existent la destinatie trebuie sa fie gol.
+async fn move_path(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(body): Json<MoveRequest>,
+) -> Result<StatusCode, Response> {
+    let user = auth(&app, &headers).await?;
+    let bad = || text(StatusCode::BAD_REQUEST, "Cale invalida.");
+    let from = safe(body.from.trim_matches('/')).ok_or_else(bad)?;
+    let to = safe(body.to.trim_matches('/')).ok_or_else(bad)?;
+    if to.starts_with(&from) {
+        return Err(text(StatusCode::BAD_REQUEST, "Destinatia este in interiorul sursei."));
+    }
+    let root = app.data.join("files").join(&user.name);
+    let (source, dest) = (root.join(&from), root.join(&to));
+    if tokio::fs::symlink_metadata(&source).await.is_err() {
+        return Err(text(StatusCode::NOT_FOUND, "Sursa nu exista."));
+    }
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent).await.map_err(internal)?;
+    }
+    tokio::fs::rename(&source, &dest)
+        .await
+        .map_err(|e| text(StatusCode::CONFLICT, format!("Nu pot muta: {e}")))?;
+    let (from, to) = (from.to_string_lossy().to_string(), to.to_string_lossy().to_string());
+    // Randurile se muta cu tot cu hash, apoi indexul este aliniat cu discul.
+    index::carry(&app.pool, user.id, &from, &to).await.map_err(internal)?;
+    index::sync(&app.pool, &root, user.id, &to).await.map_err(internal)?;
+    index::sync(&app.pool, &root, user.id, &from).await.map_err(internal)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(serde::Deserialize)]

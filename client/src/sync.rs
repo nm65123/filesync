@@ -81,6 +81,13 @@ fn now() -> i64 {
         .unwrap_or(0)
 }
 
+/// "2026-11-16 13:30:20" (UTC), pentru jurnal.
+pub fn timestamp() -> String {
+    let secs = now();
+    let rest = secs.rem_euclid(86_400);
+    format!("{} {:02}:{:02}:{:02}", date(secs), rest / 3600, rest % 3600 / 60, rest % 60)
+}
+
 /// "2026-11-16" din secunde Unix (UTC).
 fn date(secs: i64) -> String {
     let z = secs.div_euclid(86_400) + 719_468;

@@ -354,34 +354,113 @@ cargo build --release -p filesync-client
 The program is `target\release\filesync-client.exe`; copy it wherever you
 like. The Windows build has not been tested yet.
 
-### 4.2 Connect
+### 4.2 Before you connect: certificate and token
 
-You need the server's address, a user name, an app token
-(`filesync addtoken alice` on the server) and, for a server with its own
-certificate authority, the certificate file from step 3.1.
+The client needs two things from the server. Prepare them first.
+
+**The certificate file** (only when the server uses its own certificate
+authority, as in step 1.5). On the computer that will run the client:
+
+```sh
+curl -k https://192.168.0.48:8443/cert.crt -o filesync.crt
+openssl x509 -in filesync.crt -noout -fingerprint -sha256
+```
+
+On Windows use `curl.exe` and the fingerprint lines from step 3.1. The
+fingerprint must be the one printed by `gencert` on the server. The client
+uses this file; it does not look at the certificates installed in the
+operating system, so this step is needed even if you did step 3.1.
+
+**An app token**, one for each computer. On the server:
+
+```sh
+set -a; . /etc/filesync.env; set +a
+filesync adduser alice        # only if the account does not exist yet
+filesync addtoken alice
+```
+
+`addtoken` prints the token, a line of 64 letters and digits, exactly once:
+copy it now, it cannot be shown again. It also prints the token's id (8
+characters). The token replaces the password for this computer. When a
+computer is lost or retired, delete only its token and the others keep
+working:
+
+```sh
+filesync tokens alice         # ids and creation dates
+filesync deltoken alice ID
+```
+
+### 4.3 Connect
 
 ```sh
 filesync-client setup --url https://192.168.0.48:8443 --user alice \
     --dir ~/Files --ca-cert filesync.crt
 ```
 
-It asks for the token, checks the connection and remembers everything. The
-client uses the certificate file you give it; it does not look at the
-certificates installed in the operating system. Leave `--ca-cert` out when
-the server has a certificate from a public authority.
+On Windows:
 
-### 4.3 Run
+```powershell
+.\filesync-client.exe setup --url https://192.168.0.48:8443 --user alice `
+    --dir $HOME\Files --ca-cert $HOME\filesync.crt
+```
+
+It asks for the token (paste it and press Enter), checks the connection and
+remembers everything. Start with a new, empty directory, or with one whose
+content you want merged with the server. Leave `--ca-cert` out when the
+server has a certificate from a public authority. `--token-file FILE` reads
+the token from a file instead of asking.
+
+To replace a token later, run `setup` again with the same directory; the
+sync state is kept.
+
+### 4.4 Run
 
 ```sh
-filesync-client run          # keeps syncing every 10 seconds; Ctrl+C stops
 filesync-client once         # one sync, then exit
+filesync-client run          # keeps syncing every 10 seconds; Ctrl+C stops
 filesync-client status
 ```
 
 `--interval N` changes the pause. `--profile NAME` (on every command) lets
-one computer sync several directories or accounts.
+one computer sync several directories or accounts. Only one client can run
+per profile; a second one refuses to start.
 
-### 4.4 What it does
+**In the background.** On Windows:
+
+```powershell
+.\filesync-client.exe autostart on      # autostart off  undoes it
+```
+
+The client then starts by itself at every sign-in, without a window, and
+writes what it does to `%APPDATA%\filesync-client\default\client.log`. Do
+not move the program afterwards (or run `autostart on` again from its new
+place).
+
+On Linux, as a systemd user service:
+
+```sh
+mkdir -p ~/.config/systemd/user
+cat > ~/.config/systemd/user/filesync-client.service <<'UNIT'
+[Unit]
+Description=filesync client
+
+[Service]
+ExecStart=/usr/local/bin/filesync-client run
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target
+UNIT
+systemctl --user daemon-reload
+systemctl --user enable --now filesync-client
+journalctl --user -u filesync-client -n 20
+```
+
+Anywhere, `--log FILE` writes the messages to a file, with date and time
+(UTC), instead of the screen.
+
+### 4.5 What it does
 
 - New and changed files travel in both directions, with their original
   dates. Every download is verified against the server's hash.

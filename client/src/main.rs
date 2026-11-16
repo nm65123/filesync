@@ -6,9 +6,26 @@ mod state;
 mod sync;
 
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 type Res<T> = Result<T, String>;
+
+/// Fisierul de jurnal, cand clientul ruleaza in fundal (`--log`).
+static LOG: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
+
+/// Scrie o linie: pe ecran sau, cu `--log`, in fisierul de jurnal, cu data si ora.
+fn out(line: &str) {
+    match LOG.get() {
+        Some(file) => {
+            if let Ok(mut file) = file.lock() {
+                let _ = writeln!(file, "{} {line}", sync::timestamp());
+            }
+        }
+        None => println!("{line}"),
+    }
+}
 
 const HELP: &str = "\
 filesync-client setup --url URL --user NUME --dir DIRECTOR [--ca-cert FISIER] [--token-file FISIER]
@@ -17,9 +34,12 @@ filesync-client once             o sincronizare, apoi se opreste
 filesync-client run [--interval SECUNDE]
                                  sincronizeaza continuu (implicit la 10 secunde)
 filesync-client status           arata configuratia si ce stie clientul
+filesync-client autostart on|off
+                                 (Windows) porneste clientul singur, in fundal, la autentificare
 
 Optiuni comune:
   --profile NUME                 mai multe legaturi pe acelasi calculator (implicit: default)
+  --log FISIER                   scrie in fisier in loc de ecran (pentru rularea in fundal)
   --allow-mass-delete            permite stergerea de pe server a multor fisiere deodata";
 
 #[derive(Serialize, Deserialize)]
@@ -61,6 +81,65 @@ fn host_name() -> String {
         .map(|name| name.trim().to_string())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "calculator".into())
+}
+
+/// Un singur client pe profil. Blocarea dispare singura cand programul se opreste.
+fn lock(home: &Path) -> Res<std::fs::File> {
+    let path = home.join("lock");
+    let file = std::fs::File::options()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|e| format!("nu pot deschide {}: {e}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            Err("un alt filesync-client ruleaza deja pe acest profil".into())
+        }
+        Err(std::fs::TryLockError::Error(e)) => Err(format!("nu pot bloca {}: {e}", path.display())),
+    }
+}
+
+/// Pornire automata pe Windows: un mic script in dosarul Startup, care lanseaza
+/// clientul fara fereastra, cu jurnalul scris in fisier.
+fn autostart(home: &Path, profile: &str, args: &[String]) -> Res<()> {
+    if !cfg!(windows) {
+        return Err("autostart este pentru Windows. Pe Linux foloseste un serviciu systemd de utilizator (vezi README).".into());
+    }
+    let startup = PathBuf::from(std::env::var("APPDATA").map_err(|_| "lipseste variabila APPDATA")?)
+        .join("Microsoft")
+        .join("Windows")
+        .join("Start Menu")
+        .join("Programs")
+        .join("Startup")
+        .join(format!("filesync-client-{profile}.vbs"));
+    match args.get(1).map(String::as_str) {
+        Some("on") => {
+            load(home)?; // trebuie sa existe o configuratie
+            let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+            let log = home.join("client.log");
+            let script = format!(
+                "CreateObject(\"WScript.Shell\").Run \"\"\"{}\"\" run --profile {profile} --log \"\"{}\"\"\", 0, False\r\n",
+                exe.display(),
+                log.display()
+            );
+            std::fs::write(&startup, script).map_err(|e| format!("nu pot scrie {}: {e}", startup.display()))?;
+            let _ = std::process::Command::new("wscript.exe").arg(&startup).spawn();
+            println!("Clientul porneste de acum singur la autentificare, in fundal.");
+            println!("Program: {}  (nu il muta; daca il muti, ruleaza din nou `autostart on`)", exe.display());
+            println!("Jurnal:  {}", log.display());
+            Ok(())
+        }
+        Some("off") => {
+            match std::fs::remove_file(&startup) {
+                Ok(()) => println!("Pornirea automata a fost scoasa. Clientul care ruleaza acum se opreste la deconectare."),
+                Err(_) => println!("Pornirea automata nu era activa."),
+            }
+            Ok(())
+        }
+        _ => Err("foloseste: filesync-client autostart on|off".into()),
+    }
 }
 
 fn load(home: &Path) -> Res<(Config, api::Api)> {
@@ -130,7 +209,7 @@ fn sync(home: &Path, config: &Config, api: &api::Api, options: &sync::Options) -
     let mut state = state::State::load(&state_path)?;
     let mut total = sync::Report::default();
     for _ in 0..5 {
-        let mut log = |line: String| println!("{line}");
+        let mut log = |line: String| out(&line);
         let result = sync::sync_once(api, &config.dir, &mut state, options, &mut log);
         state.save(&state_path)?; // si ce s-a facut pana la o eroare ramane tinut minte
         let report = result?;
@@ -165,7 +244,19 @@ fn summary(report: &sync::Report) -> String {
 fn start() -> Res<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = args.first().map(String::as_str).unwrap_or("help");
-    let home = home(&option(&args, "--profile").unwrap_or_else(|| "default".into()))?;
+    let profile = option(&args, "--profile").unwrap_or_else(|| "default".into());
+    if profile.is_empty() || !profile.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return Err("numele profilului poate contine doar litere, cifre, - si _".into());
+    }
+    let home = home(&profile)?;
+    if let Some(path) = option(&args, "--log") {
+        let file = std::fs::File::options()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| format!("nu pot scrie jurnalul {path}: {e}"))?;
+        let _ = LOG.set(Mutex::new(file));
+    }
     let options = sync::Options {
         allow_mass_delete: args.iter().any(|a| a == "--allow-mass-delete"),
         host: host_name(),
@@ -173,10 +264,27 @@ fn start() -> Res<()> {
     };
     match command {
         "setup" => setup(&home, &args),
+        "autostart" => autostart(&home, &profile, &args),
         "once" => {
             let (config, api) = load(&home)?;
-            let report = sync(&home, &config, &api, &options)?;
-            println!("{}", summary(&report));
+            let _guard = lock(&home)?;
+            let mut report = sync(&home, &config, &api, &options)?;
+            // Fisierele abia scrise sunt asteptate putin, apoi se mai incearca.
+            for _ in 0..3 {
+                if report.pending == 0 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(options.settle.max(0) as u64 + 1));
+                let again = sync(&home, &config, &api, &options)?;
+                report.uploaded += again.uploaded;
+                report.downloaded += again.downloaded;
+                report.deleted_local += again.deleted_local;
+                report.deleted_remote += again.deleted_remote;
+                report.conflicts += again.conflicts;
+                report.errors += again.errors;
+                report.pending = again.pending;
+            }
+            out(&summary(&report));
             if report.errors > 0 {
                 return Err("sincronizare incompleta".into());
             }
@@ -184,13 +292,28 @@ fn start() -> Res<()> {
         }
         "run" => {
             let (config, api) = load(&home)?;
+            let _guard = lock(&home)?;
             let interval = option(&args, "--interval").and_then(|v| v.parse::<u64>().ok()).unwrap_or(10).max(1);
-            println!("Sincronizez {} cu {} la fiecare {interval} secunde. Ctrl+C opreste.", config.dir.display(), config.url);
+            out(&format!(
+                "Sincronizez {} cu {} la fiecare {interval} secunde.",
+                config.dir.display(),
+                config.url
+            ));
+            let mut last_error = String::new();
             loop {
                 match sync(&home, &config, &api, &options) {
-                    Ok(report) if report.changed() || report.errors > 0 => println!("{}", summary(&report)),
-                    Ok(_) => {}
-                    Err(e) => eprintln!("eroare: {e}"),
+                    Ok(report) => {
+                        if report.changed() || report.errors > 0 {
+                            out(&summary(&report));
+                        }
+                        last_error.clear();
+                    }
+                    // Aceeasi eroare (de exemplu server oprit) este scrisa o singura data.
+                    Err(e) if e != last_error => {
+                        out(&format!("eroare: {e}"));
+                        last_error = e;
+                    }
+                    Err(_) => {}
                 }
                 std::thread::sleep(std::time::Duration::from_secs(interval));
             }

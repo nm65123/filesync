@@ -1,6 +1,6 @@
 #!/bin/bash
-# filesync, pasul 13: pe macOS discul virtual se monteaza direct prin unealta macFUSE (fara libfuse).
-# Ruleaza pe serverul filesync:  bash filesync-pas13.sh
+# filesync, pasul 14: macOS - unealta de montare nu mai este intrerupta la sfarsit.
+# Ruleaza pe serverul filesync:  bash filesync-pas14.sh
 cd ~/filesync || exit 1
 source ~/.cargo/env 2>/dev/null
 cat > client/src/mount.rs <<'FILESYNC_EOF'
@@ -1130,11 +1130,22 @@ fn helper_mount(mountpoint: &Path, log: fn(&str)) -> Result<OwnedFd, String> {
             ));
         }
     };
-    // Unealta se incheie abia dupa ce montarea este completa; o asteptam in fundal.
-    std::thread::spawn(move || match child.wait() {
-        Ok(status) if status.success() => {}
-        Ok(status) => log(&format!("ATENTIE: unealta de montare s-a incheiat cu {status}")),
-        Err(e) => log(&format!("ATENTIE: unealta de montare: {e}")),
+    // Unealta se incheie abia dupa ce montarea este completa si mai scrie pe socket
+    // la sfarsit. Tinem capatul nostru deschis si citim pana termina, apoi o asteptam.
+    std::thread::spawn(move || {
+        let mut buffer = [0u8; 256];
+        loop {
+            // SAFETY: citire intr-un tampon valid, de pe un descriptor pe care il detinem.
+            let n = unsafe { libc::read(local.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) };
+            if n == 0 || (n < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted) {
+                break;
+            }
+        }
+        match child.wait() {
+            Ok(status) if status.success() => {}
+            Ok(status) => log(&format!("ATENTIE: unealta de montare s-a incheiat cu {status}")),
+            Err(e) => log(&format!("ATENTIE: unealta de montare: {e}")),
+        }
     });
     Ok(device)
 }

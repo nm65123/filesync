@@ -13,8 +13,10 @@ use fuser::{
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
 use std::fs::File;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1031,16 +1033,21 @@ pub fn mount(api: Api, home: &Path, mountpoint: &Path, cache_limit: u64, host: S
     shared.refresh(true).map_err(|e| format!("nu pot citi lista de fisiere de pe server: {e}"))?;
 
     let mut config = fuser::Config::default();
-    config.mount_options.extend([MountOption::FSName("filesync".into()), MountOption::RW]);
-    if cfg!(target_os = "macos") {
-        config.mount_options.extend([
-            MountOption::CUSTOM("volname=filesync".into()),
-            MountOption::CUSTOM("noappledouble".into()),
-        ]);
-    }
-    config.n_threads = Some(4);
-    let session = fuser::spawn_mount(Drive(shared.clone()), mountpoint, &config)
-        .map_err(|e| format!("nu pot monta la {}: {e}", mountpoint.display()))?;
+    // Mai multe fire de lucru sunt posibile doar pe Linux.
+    config.n_threads = Some(if cfg!(target_os = "linux") { 4 } else { 1 });
+    // Pe macOS montam direct prin unealta macFUSE; pe Linux, prin biblioteca
+    // (FILESYNC_DIRECT_MOUNT=1 alege si acolo calea directa, pentru incercari).
+    let direct = cfg!(target_os = "macos") || std::env::var("FILESYNC_DIRECT_MOUNT").is_ok();
+    let failed = |e: std::io::Error| format!("nu pot monta la {}: {e}", mountpoint.display());
+    let session = if direct {
+        let device = helper_mount(mountpoint, log)?;
+        fuser::Session::from_fd(Drive(shared.clone()), device, fuser::SessionACL::Owner, config)
+            .and_then(|session| session.spawn())
+            .map_err(failed)?
+    } else {
+        config.mount_options.extend([MountOption::FSName("filesync".into())]);
+        fuser::spawn_mount(Drive(shared.clone()), mountpoint, &config).map_err(failed)?
+    };
     log(&format!("Montat la {}. Ctrl+C demonteaza.", mountpoint.display()));
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -1062,9 +1069,144 @@ pub fn mount(api: Api, home: &Path, mountpoint: &Path, cache_limit: u64, host: S
     }
     if session.guard.is_finished() {
         let _ = session.join();
+    } else if direct {
+        if !unmount(mountpoint) {
+            return Err(format!(
+                "nu am putut demonta {} (este folosit de un program?). Inchide ce il foloseste si ruleaza: umount {}",
+                mountpoint.display(),
+                mountpoint.display()
+            ));
+        }
+        let _ = session.join();
     } else {
         session.umount_and_join().map_err(|e| format!("demontare: {e}"))?;
     }
     log("Demontat.");
     Ok(())
+}
+
+/// Monteaza prin unealta sistemului (mount_macfuse pe macOS, fusermount3 pe Linux),
+/// fara biblioteca libfuse. Unealta deschide dispozitivul FUSE si ni-l trimite
+/// printr-un socket; de acolo vorbim direct cu nucleul.
+fn helper_mount(mountpoint: &Path, log: fn(&str)) -> Result<OwnedFd, String> {
+    let (local, remote) = socket_pair().map_err(|e| format!("socketpair: {e}"))?;
+    let mut command = if cfg!(target_os = "macos") {
+        let exe = std::env::current_exe().unwrap_or_default();
+        let mut command = Command::new("/Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse");
+        command
+            .arg("-o")
+            .arg("fsname=filesync,volname=filesync,noappledouble")
+            .arg(mountpoint)
+            .env("_FUSE_CALL_BY_LIB", "")
+            .env("_FUSE_DAEMON_PATH", &exe)
+            .env("_FUSE_COMMVERS", "2")
+            .env("MOUNT_OSXFUSE_CALL_BY_LIB", "")
+            .env("MOUNT_OSXFUSE_DAEMON_PATH", &exe);
+        command
+    } else {
+        let mut command = Command::new("fusermount3");
+        command.arg("-o").arg("rw,nosuid,nodev,fsname=filesync").arg("--").arg(mountpoint);
+        command
+    };
+    // Capatul `remote` este mostenit de unealta; ii spunem numarul lui.
+    command.env("_FUSE_COMMFD", remote.as_raw_fd().to_string()).stdin(Stdio::null());
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("nu pot porni unealta de montare ({:?}): {e}", command.get_program()))?;
+    drop(remote);
+
+    let device = match receive_fd(&local) {
+        Ok(device) => device,
+        Err(e) => {
+            let status = child.wait().map(|s| s.to_string()).unwrap_or_default();
+            return Err(format!(
+                "unealta de montare nu a reusit ({e}; {status}). Mesajul ei, daca exista, este mai sus."
+            ));
+        }
+    };
+    // Unealta se incheie abia dupa ce montarea este completa; o asteptam in fundal.
+    std::thread::spawn(move || match child.wait() {
+        Ok(status) if status.success() => {}
+        Ok(status) => log(&format!("ATENTIE: unealta de montare s-a incheiat cu {status}")),
+        Err(e) => log(&format!("ATENTIE: unealta de montare: {e}")),
+    });
+    Ok(device)
+}
+
+fn socket_pair() -> std::io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds: [libc::c_int; 2] = [0; 2];
+    // SAFETY: `fds` are loc pentru cei doi descriptori pe care ii scrie socketpair.
+    if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: descriptorii tocmai au fost creati si nu apartin nimanui altcuiva.
+    let (local, remote) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    // Capatul nostru nu trebuie mostenit de unealta.
+    // SAFETY: fcntl pe un descriptor valid.
+    unsafe { libc::fcntl(local.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    Ok((local, remote))
+}
+
+/// Primeste un descriptor de fisier trimis prin socket (SCM_RIGHTS).
+fn receive_fd(socket: &OwnedFd) -> std::io::Result<OwnedFd> {
+    let mut data = [0u8; 64];
+    let mut iov = libc::iovec { iov_base: data.as_mut_ptr().cast(), iov_len: data.len() };
+    // SAFETY: CMSG_SPACE doar calculeaza o marime.
+    let space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) } as usize;
+    let mut control = vec![0u8; space];
+    // SAFETY: msghdr este o structura simpla; zero este o valoare valida pentru toate campurile.
+    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+    message.msg_iov = &mut iov;
+    message.msg_iovlen = 1;
+    message.msg_control = control.as_mut_ptr().cast();
+    message.msg_controllen = space as _;
+    loop {
+        // SAFETY: `message` indica spre zone de memorie valide, care traiesc pe durata apelului.
+        let received = unsafe { libc::recvmsg(socket.as_raw_fd(), &mut message, 0) };
+        if received < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if received == 0 {
+            return Err(std::io::Error::other("nu a trimis dispozitivul FUSE"));
+        }
+        break;
+    }
+    // SAFETY: antetul de control, daca exista, se afla in `control`, care este inca valid.
+    let fd = unsafe {
+        let header = libc::CMSG_FIRSTHDR(&message);
+        if header.is_null()
+            || (*header).cmsg_level != libc::SOL_SOCKET
+            || (*header).cmsg_type != libc::SCM_RIGHTS
+        {
+            return Err(std::io::Error::other("raspuns neasteptat de la unealta de montare"));
+        }
+        std::ptr::read_unaligned(libc::CMSG_DATA(header).cast::<RawFd>())
+    };
+    // SAFETY: descriptorul tocmai a fost primit si ne apartine; fcntl pe un descriptor valid.
+    unsafe {
+        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        Ok(OwnedFd::from_raw_fd(fd))
+    }
+}
+
+/// Demonteaza un disc montat pe calea directa.
+fn unmount(mountpoint: &Path) -> bool {
+    let attempts: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
+        &[("umount", &[]), ("diskutil", &["unmount", "force"])]
+    } else {
+        &[("fusermount3", &["-u"])]
+    };
+    attempts.iter().any(|(program, args)| {
+        Command::new(program)
+            .args(*args)
+            .arg(mountpoint)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    })
 }

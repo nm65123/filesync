@@ -41,14 +41,16 @@ filesync-client status           arata configuratia si ce stie clientul
 filesync-client mount DIRECTOR [--cache-size 5G]
                                  (Linux, macOS) disc virtual: fisierele apar fara sa ocupe
                                  spatiu si sunt aduse la deschidere
-filesync-client cloud DIRECTOR [--cache-size 5G] [--free-after ZILE]
+filesync-client cloud [DIRECTOR] [--cache-size 5G] [--free-after ZILE]
                                  (Windows) fisiere virtuale, ca OneDrive: apar in Explorer fara
                                  sa ocupe spatiu si sunt aduse la deschidere; cele nedeschise
-                                 de ZILE zile sunt golite din nou (implicit 30; 0 = niciodata)
-filesync-client cloud DIRECTOR --unregister
+                                 de ZILE zile sunt golite din nou (implicit 30; 0 = niciodata).
+                                 Directorul si optiunile sunt tinute minte pentru data viitoare.
+filesync-client cloud --unregister
                                  (Windows) scoate directorul dintre fisierele virtuale
 filesync-client autostart on|off
                                  (Windows) porneste clientul singur, in fundal, la autentificare
+                                 (`run` sau `cloud`, dupa cum este folosit profilul)
 
 Optiuni comune:
   --profile NUME                 mai multe legaturi pe acelasi calculator (implicit: default)
@@ -64,6 +66,13 @@ struct Config {
     #[serde(default)]
     dir: Option<PathBuf>,
     ca_cert: Option<PathBuf>,
+    /// (Windows) directorul cu fisiere virtuale, tinut minte de la prima rulare a lui `cloud`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cloud_dir: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cloud_cache_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cloud_free_after_days: Option<i64>,
 }
 
 impl Config {
@@ -154,17 +163,23 @@ fn autostart(home: &Path, profile: &str, args: &[String]) -> Res<()> {
         .join(format!("filesync-client-{profile}.vbs"));
     match args.get(1).map(String::as_str) {
         Some("on") => {
-            load(home)?; // trebuie sa existe o configuratie
+            let (config, _) = load(home)?; // trebuie sa existe o configuratie
             let exe = std::env::current_exe().map_err(|e| e.to_string())?;
             let log = home.join("client.log");
+            // Un profil folosit pentru fisiere virtuale porneste `cloud`; altfel `run`.
+            let command = match (&config.cloud_dir, &config.dir) {
+                (Some(_), _) => "cloud",
+                (None, Some(_)) => "run",
+                (None, None) => return Err("profilul nu are nici director de sincronizat, nici fisiere virtuale; ruleaza intai `setup --dir` sau `cloud DIRECTOR`".into()),
+            };
             let script = format!(
-                "CreateObject(\"WScript.Shell\").Run \"\"\"{}\"\" run --profile {profile} --log \"\"{}\"\"\", 0, False\r\n",
+                "CreateObject(\"WScript.Shell\").Run \"\"\"{}\"\" {command} --profile {profile} --log \"\"{}\"\"\", 0, False\r\n",
                 exe.display(),
                 log.display()
             );
             std::fs::write(&startup, script).map_err(|e| format!("nu pot scrie {}: {e}", startup.display()))?;
             let _ = std::process::Command::new("wscript.exe").arg(&startup).spawn();
-            println!("Clientul porneste de acum singur la autentificare, in fundal.");
+            println!("Clientul ({command}) porneste de acum singur la autentificare, in fundal.");
             println!("Program: {}  (nu il muta; daca il muti, ruleaza din nou `autostart on`)", exe.display());
             println!("Jurnal:  {}", log.display());
             Ok(())
@@ -178,6 +193,12 @@ fn autostart(home: &Path, profile: &str, args: &[String]) -> Res<()> {
         }
         _ => Err("foloseste: filesync-client autostart on|off".into()),
     }
+}
+
+fn save_config(home: &Path, config: &Config) -> Res<()> {
+    let path = home.join("config.json");
+    std::fs::write(&path, serde_json::to_vec_pretty(config).map_err(|e| e.to_string())?)
+        .map_err(|e| format!("nu pot scrie {}: {e}", path.display()))
 }
 
 fn load(home: &Path) -> Res<(Config, api::Api)> {
@@ -231,14 +252,21 @@ fn setup(home: &Path, args: &[String]) -> Res<()> {
         }
         None => None,
     };
-    let config = Config { url, user, token, dir, ca_cert };
-    let path = home.join("config.json");
-    std::fs::write(&path, serde_json::to_vec_pretty(&config).map_err(|e| e.to_string())?)
-        .map_err(|e| format!("nu pot scrie {}: {e}", path.display()))?;
+    let config = Config {
+        url,
+        user,
+        token,
+        dir,
+        ca_cert,
+        cloud_dir: None,
+        cloud_cache_size: None,
+        cloud_free_after_days: None,
+    };
+    save_config(home, &config)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        let _ = std::fs::set_permissions(home.join("config.json"), std::fs::Permissions::from_mode(0o600));
     }
     println!("Conectat la {} ca {}.", config.url, config.user);
     match &config.dir {
@@ -401,24 +429,30 @@ fn start() -> Res<()> {
         "cloud" => {
             #[cfg(windows)]
             {
-                let target = args
-                    .get(1)
-                    .filter(|a| !a.starts_with("--"))
-                    .ok_or("lipseste directorul pentru fisierele virtuale")?;
-                if args.iter().any(|a| a == "--unregister") {
-                    return cloud::unregister(Path::new(target));
-                }
-                let limit = match option(&args, "--cache-size") {
-                    Some(text) => parse_size(&text).ok_or("--cache-size: foloseste 5G, 500M...")?,
-                    None => 5 << 30,
+                let (mut config, api) = load(&home)?;
+                let given = args.get(1).filter(|a| !a.starts_with("--")).map(PathBuf::from);
+                let target = match given.or_else(|| config.cloud_dir.clone()) {
+                    Some(dir) => dir,
+                    None => return Err("lipseste directorul pentru fisierele virtuale (prima data: filesync-client cloud DIRECTOR)".into()),
                 };
-                let free_after = match option(&args, "--free-after") {
-                    Some(text) => text.parse::<i64>().ok().filter(|d| *d >= 0).ok_or("--free-after: un numar de zile")?,
-                    None => 30,
-                } * 86_400;
-                let (_, api) = load(&home)?;
+                if args.iter().any(|a| a == "--unregister") {
+                    return cloud::unregister(&target);
+                }
+                if let Some(text) = option(&args, "--cache-size") {
+                    config.cloud_cache_size = Some(parse_size(&text).ok_or("--cache-size: foloseste 5G, 500M...")?);
+                }
+                if let Some(text) = option(&args, "--free-after") {
+                    config.cloud_free_after_days =
+                        Some(text.parse::<i64>().ok().filter(|d| *d >= 0).ok_or("--free-after: un numar de zile")?);
+                }
+                let limit = config.cloud_cache_size.unwrap_or(5 << 30);
+                let free_after = config.cloud_free_after_days.unwrap_or(30) * 86_400;
                 let _guard = lock(&home)?;
-                cloud::run(api, &home, Path::new(target), limit, options.host.clone(), options.allow_mass_delete, free_after, out)
+                // Ce s-a dat acum ramane pentru data viitoare (si pentru autostart).
+                std::fs::create_dir_all(&target).map_err(|e| format!("nu pot crea {}: {e}", target.display()))?;
+                config.cloud_dir = Some(target.canonicalize().map_err(|e| e.to_string())?);
+                save_config(&home, &config)?;
+                cloud::run(api, &home, &target, limit, options.host.clone(), options.allow_mass_delete, free_after, out)
             }
             #[cfg(not(windows))]
             {

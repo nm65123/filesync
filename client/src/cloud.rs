@@ -408,6 +408,37 @@ impl Shared {
         Ok(changed)
     }
 
+    /// Directoarele create de versiunile vechi au data 1970 (serverul nu tine data lor):
+    /// primesc data de acum.
+    fn fix_dir_dates(&self) {
+        let dirs: Vec<String> = self.state().files.iter().filter(|(_, k)| k.dir).map(|(p, _)| p.clone()).collect();
+        for path in dirs {
+            let old = std::fs::metadata(self.local(&path))
+                .ok()
+                .map(|m| scan::mtime_of(&m))
+                .is_some_and(|secs| secs < 365 * 86_400);
+            if !old {
+                continue;
+            }
+            let Ok(opened) = self.open(&path, CF_OPEN_FILE_FLAG_WRITE_ACCESS) else { continue };
+            let meta = metadata(true, 0, 0);
+            // SAFETY: handle valid; metadatele traiesc pe durata apelului.
+            unsafe {
+                CfUpdatePlaceholder(
+                    opened.0,
+                    &meta,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                    CF_UPDATE_FLAG_NONE,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                );
+            }
+        }
+    }
+
     /// Tine minte ca un fisier a fost deschis (sau tocmai a primit continut).
     fn touched(&self, identity: &str) {
         let mut state = self.state();
@@ -1011,6 +1042,7 @@ pub fn run(
     let hr = unsafe { CfConnectSyncRoot(path.as_ptr(), callbacks.as_ptr(), std::ptr::null(), CF_CONNECT_FLAG_NONE, &mut connection) };
     check(hr, &format!("nu ma pot lega de {}", root.display()))?;
 
+    shared.fix_dir_dates();
     match shared.refresh() {
         Ok(n) => {
             log(&format!("Fisiere virtuale in {} ({n} schimbari la pornire). Ctrl+C opreste.", root.display()));

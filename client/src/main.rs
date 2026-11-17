@@ -41,9 +41,10 @@ filesync-client status           arata configuratia si ce stie clientul
 filesync-client mount DIRECTOR [--cache-size 5G]
                                  (Linux, macOS) disc virtual: fisierele apar fara sa ocupe
                                  spatiu si sunt aduse la deschidere
-filesync-client cloud DIRECTOR [--cache-size 5G]
+filesync-client cloud DIRECTOR [--cache-size 5G] [--free-after ZILE]
                                  (Windows) fisiere virtuale, ca OneDrive: apar in Explorer fara
-                                 sa ocupe spatiu si sunt aduse la deschidere
+                                 sa ocupe spatiu si sunt aduse la deschidere; cele nedeschise
+                                 de ZILE zile sunt golite din nou (implicit 30; 0 = niciodata)
 filesync-client cloud DIRECTOR --unregister
                                  (Windows) scoate directorul dintre fisierele virtuale
 filesync-client autostart on|off
@@ -411,9 +412,13 @@ fn start() -> Res<()> {
                     Some(text) => parse_size(&text).ok_or("--cache-size: foloseste 5G, 500M...")?,
                     None => 5 << 30,
                 };
+                let free_after = match option(&args, "--free-after") {
+                    Some(text) => text.parse::<i64>().ok().filter(|d| *d >= 0).ok_or("--free-after: un numar de zile")?,
+                    None => 30,
+                } * 86_400;
                 let (_, api) = load(&home)?;
                 let _guard = lock(&home)?;
-                cloud::run(api, &home, Path::new(target), limit, options.host.clone(), options.allow_mass_delete, out)
+                cloud::run(api, &home, Path::new(target), limit, options.host.clone(), options.allow_mass_delete, free_after, out)
             }
             #[cfg(not(windows))]
             {

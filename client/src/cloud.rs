@@ -9,6 +9,7 @@
 //! in substituenti), cele disparute sunt sterse de pe server, cele mutate sunt mutate.
 //! Un fisier schimbat in ambele parti: versiunea de pe server ramane sub numele original,
 //! cea locala este urcata ca "nume (conflict data calculator).ext".
+//! Spatiul: un fisier adus si nedeschis de un timp (`--free-after`) este golit din nou.
 
 use crate::api::{Api, Entry, Fail};
 use crate::scan::{self, Local};
@@ -48,6 +49,9 @@ struct Known {
     hash: String,
     mtime: i64,
     version: i64,
+    /// Cand a fost deschis ultima data (secunde Unix); 0 = nu are continut local.
+    #[serde(default)]
+    opened: i64,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -88,6 +92,8 @@ struct Shared {
     counter: AtomicU64,
     host: String,
     allow_mass_delete: bool,
+    /// Dupa cate secunde fara deschidere un fisier adus este golit; 0 = niciodata.
+    free_after: i64,
     /// Lucruri deja anuntate ca amanate, ca sa nu le repetam la fiecare trecere.
     quiet: Mutex<HashSet<String>>,
     log: fn(&str),
@@ -323,6 +329,7 @@ impl Shared {
                 hash: entry.hash.clone(),
                 mtime: entry.mtime,
                 version: entry.version,
+                opened: 0,
             },
         );
     }
@@ -399,6 +406,53 @@ impl Shared {
         self.state().cursor = new_cursor;
         self.save();
         Ok(changed)
+    }
+
+    /// Tine minte ca un fisier a fost deschis (sau tocmai a primit continut).
+    fn touched(&self, identity: &str) {
+        let mut state = self.state();
+        let path = state.aliases.get(identity).cloned().unwrap_or_else(|| identity.to_string());
+        if let Some(k) = state.files.get_mut(&path) {
+            k.opened = now();
+        }
+    }
+
+    /// Goleste fisierele aduse si nedeschise de mai mult de `free_after` secunde.
+    fn free_space(&self) {
+        if self.free_after <= 0 {
+            return;
+        }
+        let limit = now() - self.free_after;
+        let candidates: Vec<(String, Known)> = self
+            .state()
+            .files
+            .iter()
+            .filter(|(_, k)| !k.dir && k.version > 0 && k.opened > 0 && k.opened < limit)
+            .map(|(p, k)| (p.clone(), k.clone()))
+            .collect();
+        let mut freed = 0;
+        for (path, k) in candidates {
+            // Un fisier modificat local nu se goleste: intai trebuie urcat.
+            let Some(local) = scan::stat(&self.local(&path)) else { continue };
+            if local.dir || local.size != k.size || local.mtime != k.mtime {
+                continue;
+            }
+            let Ok(opened) = self.open(&path, CF_OPEN_FILE_FLAG_WRITE_ACCESS | CF_OPEN_FILE_FLAG_EXCLUSIVE) else {
+                continue; // este folosit de un program; alta data
+            };
+            // SAFETY: handle valid; lungimea -1 inseamna pana la sfarsit.
+            let hr = unsafe { CfDehydratePlaceholder(opened.0, 0, -1, CF_DEHYDRATE_FLAG_NONE, std::ptr::null_mut()) };
+            if hr >= 0 {
+                if let Some(k) = self.state().files.get_mut(&path) {
+                    k.opened = 0;
+                }
+                freed += 1;
+            }
+        }
+        if freed > 0 {
+            (self.log)(&format!("eliberat  {freed} fisiere nedeschise de {} zile (raman vizibile)", self.free_after / 86_400));
+            self.save();
+        }
     }
 
     /// Spune o data ca un lucru este amanat; a doua oara tace.
@@ -492,7 +546,7 @@ impl Shared {
                         let _ = self.mark_synced(path);
                         self.state().files.insert(
                             path.clone(),
-                            Known { dir: true, size: 0, hash: String::new(), mtime: 0, version: 0 },
+                            Known { dir: true, size: 0, hash: String::new(), mtime: 0, version: 0, opened: 0 },
                         );
                         changed = true;
                     }
@@ -563,7 +617,7 @@ impl Shared {
                 state.held.remove(path);
                 state.files.insert(
                     path.to_string(),
-                    Known { dir: false, size: local.size, hash, mtime: local.mtime, version },
+                    Known { dir: false, size: local.size, hash, mtime: local.mtime, version, opened: now() },
                 );
                 true
             }
@@ -598,7 +652,7 @@ impl Shared {
         (self.log)(&format!("CONFLICT  {path}: versiunea locala pastrata ca \"{kept}\""));
         self.state().files.insert(
             kept.clone(),
-            Known { dir: false, size: local.size, hash, mtime: local.mtime, version },
+            Known { dir: false, size: local.size, hash, mtime: local.mtime, version, opened: 0 },
         );
         // Copia de conflict exista deja pe server; substituentul ei apare la urmatoarea trecere.
         match self.update(&entry, true) {
@@ -751,7 +805,10 @@ impl Shared {
             Ok(())
         })();
         match result {
-            Ok(()) => (self.log)(&format!("adus      {}", request.path)),
+            Ok(()) => {
+                (self.log)(&format!("adus      {}", request.path));
+                self.touched(&request.path);
+            }
             Err(e) => {
                 (self.log)(&format!("EROARE    {}: {e}", request.path));
                 let _ = send(&[], 0, STATUS_CLOUD_FILE_UNSUCCESSFUL);
@@ -828,6 +885,18 @@ unsafe extern "system" fn on_cancel_fetch_data(info: *const CF_CALLBACK_INFO, _p
     (shared.log)(&format!("anulat    {} (descarcarea continua in fundal)", path));
 }
 
+/// Apelata de sistem dupa ce un program a deschis un fisier din director.
+unsafe extern "system" fn on_open_completion(info: *const CF_CALLBACK_INFO, _params: *const CF_CALLBACK_PARAMETERS) {
+    let Some(shared) = SHARED.get() else { return };
+    // SAFETY: ca la on_fetch_data.
+    let identity = unsafe {
+        let info = &*info;
+        let identity = std::slice::from_raw_parts(info.FileIdentity.cast::<u8>(), info.FileIdentityLength as usize);
+        String::from_utf8_lossy(identity).into_owned()
+    };
+    shared.touched(&identity);
+}
+
 fn register(root: &Path) -> Result<(), String> {
     let name = wide("filesync");
     let version = wide(env!("CARGO_PKG_VERSION"));
@@ -885,6 +954,7 @@ pub fn run(
     cache_limit: u64,
     host: String,
     allow_mass_delete: bool,
+    free_after: i64,
     log: fn(&str),
 ) -> Result<(), String> {
     let mut platform = CF_PLATFORM_INFO { BuildNumber: 0, RevisionNumber: 0, IntegrationNumber: 0 };
@@ -906,7 +976,11 @@ pub fn run(
         }
     }
     let state_path = home.join("cloud.json");
-    let state = State::load(&state_path);
+    let mut state = State::load(&state_path);
+    // Starea de la o versiune mai veche nu stie cand au fost deschise fisierele: de acum.
+    for k in state.files.values_mut().filter(|k| !k.dir && k.opened == 0) {
+        k.opened = now();
+    }
 
     register(&root)?;
     let shared = Arc::new(Shared {
@@ -919,6 +993,7 @@ pub fn run(
         counter: AtomicU64::new(0),
         host,
         allow_mass_delete,
+        free_after,
         quiet: Mutex::new(HashSet::new()),
         log,
     });
@@ -927,6 +1002,7 @@ pub fn run(
     let callbacks = [
         CF_CALLBACK_REGISTRATION { Type: CF_CALLBACK_TYPE_FETCH_DATA, Callback: Some(on_fetch_data) },
         CF_CALLBACK_REGISTRATION { Type: CF_CALLBACK_TYPE_CANCEL_FETCH_DATA, Callback: Some(on_cancel_fetch_data) },
+        CF_CALLBACK_REGISTRATION { Type: CF_CALLBACK_TYPE_NOTIFY_FILE_OPEN_COMPLETION, Callback: Some(on_open_completion) },
         CF_CALLBACK_REGISTRATION { Type: CF_CALLBACK_TYPE_NONE, Callback: None },
     ];
     let path = wide_path(&root);
@@ -947,9 +1023,14 @@ pub fn run(
     let flag = stop.clone();
     ctrlc::set_handler(move || flag.store(true, Ordering::SeqCst)).map_err(|e| e.to_string())?;
     let mut last = Instant::now();
+    let mut last_sweep = Instant::now();
     let mut down = false;
     while !stop.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(300));
+        if last_sweep.elapsed() >= Duration::from_secs(600) {
+            shared.free_space();
+            last_sweep = Instant::now();
+        }
         if last.elapsed() >= Duration::from_secs(10) {
             match shared.refresh() {
                 Ok(_) => {

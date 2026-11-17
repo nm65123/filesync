@@ -1048,13 +1048,15 @@ pub fn mount(api: Api, home: &Path, mountpoint: &Path, cache_limit: u64, host: S
         config.mount_options.extend([MountOption::FSName("filesync".into())]);
         fuser::spawn_mount(Drive(shared.clone()), mountpoint, &config).map_err(failed)?
     };
-    log(&format!("Montat la {}. Ctrl+C demonteaza.", mountpoint.display()));
+    log(&format!("Montat la {}. Demonteaza cu Ctrl+C sau `filesync-client stop`.", mountpoint.display()));
 
     let stop = Arc::new(AtomicBool::new(false));
     let flag = stop.clone();
     ctrlc::set_handler(move || flag.store(true, Ordering::SeqCst)).map_err(|e| e.to_string())?;
+    let stop_file = home.join("stop");
+    let _ = std::fs::remove_file(&stop_file);
     let mut last_retry = Instant::now();
-    while !stop.load(Ordering::SeqCst) && !session.guard.is_finished() {
+    while !stop.load(Ordering::SeqCst) && !session.guard.is_finished() && !stop_file.exists() {
         std::thread::sleep(Duration::from_millis(300));
         if last_retry.elapsed() > Duration::from_secs(20) {
             let _ = shared.refresh(true);
@@ -1081,6 +1083,7 @@ pub fn mount(api: Api, home: &Path, mountpoint: &Path, cache_limit: u64, host: S
     } else {
         session.umount_and_join().map_err(|e| format!("demontare: {e}"))?;
     }
+    let _ = std::fs::remove_file(&stop_file);
     log("Demontat.");
     Ok(())
 }

@@ -51,6 +51,7 @@ filesync-client cloud --unregister
 filesync-client autostart on|off
                                  (Windows) porneste clientul singur, in fundal, la autentificare
                                  (`run` sau `cloud`, dupa cum este folosit profilul)
+filesync-client stop             opreste clientul care ruleaza in fundal pe acest profil
 
 Optiuni comune:
   --profile NUME                 mai multe legaturi pe acelasi calculator (implicit: default)
@@ -375,6 +376,8 @@ fn start() -> Res<()> {
                 config.sync_dir()?.display(),
                 config.url
             ));
+            let stop_file = home.join("stop");
+            let _ = std::fs::remove_file(&stop_file);
             let mut last_error = String::new();
             loop {
                 match sync(&home, &config, &api, &options) {
@@ -391,8 +394,34 @@ fn start() -> Res<()> {
                     }
                     Err(_) => {}
                 }
-                std::thread::sleep(std::time::Duration::from_secs(interval));
+                for _ in 0..interval * 5 {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    if stop_file.exists() {
+                        let _ = std::fs::remove_file(&stop_file);
+                        out("Oprit la cerere.");
+                        return Ok(());
+                    }
+                }
             }
+        }
+        "stop" => {
+            let stop_file = home.join("stop");
+            std::fs::write(&stop_file, b"stop").map_err(|e| format!("nu pot scrie {}: {e}", stop_file.display()))?;
+            // Daca blocarea se poate lua, nu rula niciun client.
+            if lock(&home).is_ok() {
+                let _ = std::fs::remove_file(&stop_file);
+                println!("Niciun client nu ruleaza pe profilul {profile}.");
+                return Ok(());
+            }
+            for _ in 0..100 {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                if lock(&home).is_ok() {
+                    let _ = std::fs::remove_file(&stop_file);
+                    println!("Clientul de pe profilul {profile} s-a oprit.");
+                    return Ok(());
+                }
+            }
+            Err("clientul nu s-a oprit in 20 de secunde (poate termina o urcare); mai incearca".into())
         }
         "status" => {
             let (config, _) = load(&home)?;
@@ -436,7 +465,7 @@ fn start() -> Res<()> {
                     None => return Err("lipseste directorul pentru fisierele virtuale (prima data: filesync-client cloud DIRECTOR)".into()),
                 };
                 if args.iter().any(|a| a == "--unregister") {
-                    return cloud::unregister(&target);
+                    return cloud::unregister(&target, &config.user);
                 }
                 if let Some(text) = option(&args, "--cache-size") {
                     config.cloud_cache_size = Some(parse_size(&text).ok_or("--cache-size: foloseste 5G, 500M...")?);
@@ -452,7 +481,7 @@ fn start() -> Res<()> {
                 std::fs::create_dir_all(&target).map_err(|e| format!("nu pot crea {}: {e}", target.display()))?;
                 config.cloud_dir = Some(target.canonicalize().map_err(|e| e.to_string())?);
                 save_config(&home, &config)?;
-                cloud::run(api, &home, &target, limit, options.host.clone(), options.allow_mass_delete, free_after, out)
+                cloud::run(api, &home, &target, limit, options.host.clone(), &config.user, options.allow_mass_delete, free_after, out)
             }
             #[cfg(not(windows))]
             {

@@ -928,6 +928,114 @@ unsafe extern "system" fn on_open_completion(info: *const CF_CALLBACK_INFO, _par
     shared.touched(&identity);
 }
 
+// --- inregistrarea pentru Explorer (WinRT) ---
+// Da coloana "Status" cu iconite (nor, bifa), intrarea din bara laterala si numele furnizorului.
+// Fara ea totul merge la fel; de aceea esecul ei este doar anuntat.
+
+/// SID-ul utilizatorului curent, ca text ("S-1-5-21-...").
+fn user_sid() -> Result<String, String> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: apeluri Win32 cu adrese valide; token-ul este inchis la sfarsit.
+    unsafe {
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return Err("OpenProcessToken".into());
+        }
+        let mut needed = 0u32;
+        GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed);
+        let mut buffer = vec![0u8; needed.max(64) as usize];
+        let ok = GetTokenInformation(token, TokenUser, buffer.as_mut_ptr().cast(), buffer.len() as u32, &mut needed);
+        windows_sys::Win32::Foundation::CloseHandle(token);
+        if ok == 0 {
+            return Err("GetTokenInformation".into());
+        }
+        let user = &*(buffer.as_ptr() as *const TOKEN_USER);
+        let mut text: *mut u16 = std::ptr::null_mut();
+        if ConvertSidToStringSidW(user.User.Sid, &mut text) == 0 || text.is_null() {
+            return Err("ConvertSidToStringSid".into());
+        }
+        let mut len = 0;
+        while *text.add(len) != 0 {
+            len += 1;
+        }
+        let sid = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
+        LocalFree(text.cast());
+        Ok(sid)
+    }
+}
+
+/// Mesaj de eroare cu numele pasului care a esuat.
+fn fail<E: std::fmt::Display>(what: &'static str) -> impl Fn(E) -> String {
+    move |e| format!("{what}: {e}")
+}
+
+/// Identificatorul inregistrarii de shell: furnizor!SID!cont, forma ceruta de Windows.
+fn shell_id(account: &str) -> Result<String, String> {
+    Ok(format!("filesync!{}!{}", user_sid()?, account.replace('!', "_")))
+}
+
+fn shell_register(root: &Path, account: &str) -> Result<(), String> {
+    use windows::Storage::Provider::{
+        StorageProviderHardlinkPolicy, StorageProviderHydrationPolicy, StorageProviderHydrationPolicyModifier,
+        StorageProviderInSyncPolicy, StorageProviderPopulationPolicy, StorageProviderProtectionMode,
+        StorageProviderSyncRootInfo, StorageProviderSyncRootManager,
+    };
+    use windows::Storage::StorageFolder;
+    use windows::core::{GUID, HSTRING};
+    // SAFETY: initializarea WinRT pentru acest fir; a doua chemare este inofensiva.
+    let _ = unsafe { windows::Win32::System::WinRT::RoInitialize(windows::Win32::System::WinRT::RO_INIT_MULTITHREADED) };
+    if !StorageProviderSyncRootManager::IsSupported().map_err(fail("IsSupported"))? {
+        return Err("acest Windows nu are inregistrarea de shell".into());
+    }
+    let folder = StorageFolder::GetFolderFromPathAsync(&HSTRING::from(root.to_string_lossy().as_ref()))
+        .map_err(fail("GetFolderFromPathAsync"))?
+        .join()
+        .map_err(fail("director"))?;
+    let info = StorageProviderSyncRootInfo::new().map_err(fail("SyncRootInfo"))?;
+    info.SetId(&HSTRING::from(shell_id(account)?)).map_err(fail("Id"))?;
+    info.SetProviderId(GUID::from_values(
+        PROVIDER_ID.data1,
+        PROVIDER_ID.data2,
+        PROVIDER_ID.data3,
+        PROVIDER_ID.data4,
+    ))
+    .map_err(fail("ProviderId"))?;
+    info.SetPath(&folder).map_err(fail("Path"))?;
+    info.SetDisplayNameResource(&HSTRING::from(format!("filesync ({account})"))).map_err(fail("DisplayName"))?;
+    info.SetIconResource(&HSTRING::from("%SystemRoot%\\system32\\imageres.dll,-1043")).map_err(fail("Icon"))?;
+    info.SetVersion(&HSTRING::from(env!("CARGO_PKG_VERSION"))).map_err(fail("Version"))?;
+    info.SetHydrationPolicy(StorageProviderHydrationPolicy::Full).map_err(fail("HydrationPolicy"))?;
+    info.SetHydrationPolicyModifier(StorageProviderHydrationPolicyModifier::None).map_err(fail("HydrationPolicyModifier"))?;
+    info.SetPopulationPolicy(StorageProviderPopulationPolicy::AlwaysFull).map_err(fail("PopulationPolicy"))?;
+    let track_all = StorageProviderInSyncPolicy::FileCreationTime
+        | StorageProviderInSyncPolicy::FileReadOnlyAttribute
+        | StorageProviderInSyncPolicy::FileHiddenAttribute
+        | StorageProviderInSyncPolicy::FileSystemAttribute
+        | StorageProviderInSyncPolicy::FileLastWriteTime
+        | StorageProviderInSyncPolicy::DirectoryCreationTime
+        | StorageProviderInSyncPolicy::DirectoryReadOnlyAttribute
+        | StorageProviderInSyncPolicy::DirectoryHiddenAttribute
+        | StorageProviderInSyncPolicy::DirectorySystemAttribute
+        | StorageProviderInSyncPolicy::DirectoryLastWriteTime;
+    info.SetInSyncPolicy(track_all).map_err(fail("InSyncPolicy"))?;
+    info.SetHardlinkPolicy(StorageProviderHardlinkPolicy::None).map_err(fail("HardlinkPolicy"))?;
+    info.SetShowSiblingsAsGroup(false).map_err(fail("ShowSiblingsAsGroup"))?;
+    info.SetProtectionMode(StorageProviderProtectionMode::Personal).map_err(fail("ProtectionMode"))?;
+    StorageProviderSyncRootManager::Register(&info).map_err(fail("Register"))
+}
+
+fn shell_unregister(account: &str) -> Result<(), String> {
+    use windows::Storage::Provider::StorageProviderSyncRootManager;
+    use windows::core::HSTRING;
+    // SAFETY: ca mai sus.
+    let _ = unsafe { windows::Win32::System::WinRT::RoInitialize(windows::Win32::System::WinRT::RO_INIT_MULTITHREADED) };
+    StorageProviderSyncRootManager::Unregister(&HSTRING::from(shell_id(account)?)).map_err(|e| e.to_string())
+}
+// --- sfarsitul inregistrarii pentru Explorer ---
+
 fn register(root: &Path) -> Result<(), String> {
     let name = wide("filesync");
     let version = wide(env!("CARGO_PKG_VERSION"));
@@ -966,8 +1074,11 @@ fn register(root: &Path) -> Result<(), String> {
 
 /// Scoate inregistrarea. Substituentii ramasi fara continut nu mai pot fi deschisi,
 /// deci directorul trebuie sters dupa aceea.
-pub fn unregister(target: &Path) -> Result<(), String> {
+pub fn unregister(target: &Path, account: &str) -> Result<(), String> {
     let root = target.canonicalize().map_err(|e| format!("{}: {e}", target.display()))?;
+    if let Err(e) = shell_unregister(account) {
+        println!("(inregistrarea de shell nu a putut fi scoasa: {e})");
+    }
     let path = wide_path(&root);
     // SAFETY: `path` este un sir UTF-16 terminat cu zero.
     let hr = unsafe { CfUnregisterSyncRoot(path.as_ptr()) };
@@ -984,6 +1095,7 @@ pub fn run(
     target: &Path,
     cache_limit: u64,
     host: String,
+    account: &str,
     allow_mass_delete: bool,
     free_after: i64,
     log: fn(&str),
@@ -1013,7 +1125,14 @@ pub fn run(
         k.opened = now();
     }
 
-    register(&root)?;
+    // Inregistrarea pentru Explorer (iconite); daca nu merge, cea de baza ajunge.
+    match shell_register(&root, account) {
+        Ok(()) => {}
+        Err(e) => {
+            log(&format!("fara iconite in Explorer ({e}); functionarea nu este afectata"));
+            register(&root)?;
+        }
+    }
     let shared = Arc::new(Shared {
         api,
         root: root.clone(),
@@ -1045,19 +1164,21 @@ pub fn run(
     shared.fix_dir_dates();
     match shared.refresh() {
         Ok(n) => {
-            log(&format!("Fisiere virtuale in {} ({n} schimbari la pornire). Ctrl+C opreste.", root.display()));
+            log(&format!("Fisiere virtuale in {} ({n} schimbari la pornire). Opreste cu Ctrl+C sau `filesync-client stop`.", root.display()));
             shared.push();
         }
-        Err(e) => log(&format!("Fisiere virtuale in {}; serverul nu raspunde acum ({e}). Ctrl+C opreste.", root.display())),
+        Err(e) => log(&format!("Fisiere virtuale in {}; serverul nu raspunde acum ({e}). Opreste cu Ctrl+C sau `filesync-client stop`.", root.display())),
     }
 
     let stop = Arc::new(AtomicBool::new(false));
     let flag = stop.clone();
     ctrlc::set_handler(move || flag.store(true, Ordering::SeqCst)).map_err(|e| e.to_string())?;
+    let stop_file = home.join("stop");
+    let _ = std::fs::remove_file(&stop_file);
     let mut last = Instant::now();
     let mut last_sweep = Instant::now();
     let mut down = false;
-    while !stop.load(Ordering::SeqCst) {
+    while !stop.load(Ordering::SeqCst) && !stop_file.exists() {
         std::thread::sleep(Duration::from_millis(300));
         if last_sweep.elapsed() >= Duration::from_secs(600) {
             shared.free_space();
@@ -1084,6 +1205,7 @@ pub fn run(
     }
     // SAFETY: cheia este cea primita la legare.
     let hr = unsafe { CfDisconnectSyncRoot(connection) };
+    let _ = std::fs::remove_file(&stop_file);
     check(hr, "dezlegare")?;
     log("Oprit. Fisierele raman in director; cele neaduse se aduc la urmatoarea pornire.");
     Ok(())

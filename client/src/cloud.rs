@@ -987,9 +987,6 @@ fn shell_register(root: &Path, account: &str) -> Result<(), String> {
     use windows::core::{GUID, HSTRING};
     // SAFETY: initializarea WinRT pentru acest fir; a doua chemare este inofensiva.
     let _ = unsafe { windows::Win32::System::WinRT::RoInitialize(windows::Win32::System::WinRT::RO_INIT_MULTITHREADED) };
-    if !StorageProviderSyncRootManager::IsSupported().map_err(fail("IsSupported"))? {
-        return Err("acest Windows nu are inregistrarea de shell".into());
-    }
     let folder = StorageFolder::GetFolderFromPathAsync(&HSTRING::from(root.to_string_lossy().as_ref()))
         .map_err(fail("GetFolderFromPathAsync"))?
         .join()

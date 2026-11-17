@@ -413,7 +413,7 @@ fn start() -> Res<()> {
                 };
                 let (_, api) = load(&home)?;
                 let _guard = lock(&home)?;
-                cloud::run(api, &home, Path::new(target), limit, out)
+                cloud::run(api, &home, Path::new(target), limit, options.host.clone(), options.allow_mass_delete, out)
             }
             #[cfg(not(windows))]
             {

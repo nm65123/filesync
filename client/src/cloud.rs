@@ -1,12 +1,20 @@
 //! Fisiere virtuale pe Windows (Cloud Files API, mecanismul folosit de OneDrive):
 //! un director este inregistrat ca "sync root", fisierele de pe server apar in el ca
 //! substituenti (placeholders) care nu ocupa spatiu, iar continutul este adus de pe
-//! server la prima deschidere. Varianta minima: listare, aducere la deschidere,
-//! actualizari si stergeri venite de pe server. Modificarile locale nu se urca inca.
+//! server la prima deschidere.
+//!
+//! Dinspre server: substituenti noi, versiuni noi (substituentul este golit si adus din nou
+//! la deschidere), stergeri. Dinspre Windows: la fiecare cateva secunde directorul este
+//! comparat cu ce stie clientul; fisierele noi sau modificate sunt urcate (si transformate
+//! in substituenti), cele disparute sunt sterse de pe server, cele mutate sunt mutate.
+//! Un fisier schimbat in ambele parti: versiunea de pe server ramane sub numele original,
+//! cea locala este urcata ca "nume (conflict data calculator).ext".
 
 use crate::api::{Api, Entry, Fail};
+use crate::scan::{self, Local};
+use crate::sync::{date, now};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -14,8 +22,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windows_sys::Win32::Foundation::{
-    ERROR_CLOUD_FILE_IN_USE, ERROR_CLOUD_FILE_NOT_IN_SYNC, ERROR_FILE_EXISTS, ERROR_SHARING_VIOLATION,
-    HANDLE, STATUS_CLOUD_FILE_UNSUCCESSFUL, STATUS_SUCCESS,
+    ERROR_CLOUD_FILE_IN_USE, ERROR_CLOUD_FILE_NOT_IN_SYNC, ERROR_FILE_EXISTS, ERROR_FILE_NOT_FOUND,
+    ERROR_SHARING_VIOLATION, HANDLE, STATUS_CLOUD_FILE_UNSUCCESSFUL, STATUS_SUCCESS,
 };
 use windows_sys::Win32::Storage::CloudFilters::*;
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_BASIC_INFO};
@@ -47,6 +55,14 @@ struct State {
     cursor: i64,
     /// Calea relativa cu "/" -> ce am creat pe disc.
     files: BTreeMap<String, Known>,
+    /// Schimbari de pe server care nu au putut fi aplicate inca (fisier modificat local
+    /// sau folosit de un program); se reincearca la fiecare trecere.
+    #[serde(default)]
+    held: BTreeMap<String, Entry>,
+    /// Identitatea veche a substituentilor mutati -> calea de acum (cererile de continut
+    /// vin cu identitatea de la creare).
+    #[serde(default)]
+    aliases: BTreeMap<String, String>,
 }
 
 impl State {
@@ -70,6 +86,10 @@ struct Shared {
     cache: PathBuf,
     cache_limit: u64,
     counter: AtomicU64,
+    host: String,
+    allow_mass_delete: bool,
+    /// Lucruri deja anuntate ca amanate, ca sa nu le repetam la fiecare trecere.
+    quiet: Mutex<HashSet<String>>,
     log: fn(&str),
 }
 
@@ -93,6 +113,7 @@ fn hr_text(hr: i32) -> String {
             x if x == ERROR_SHARING_VIOLATION => "fisierul este folosit de alt program",
             x if x == ERROR_CLOUD_FILE_IN_USE => "fisierul este folosit",
             x if x == ERROR_CLOUD_FILE_NOT_IN_SYNC => "modificat local",
+            x if x == ERROR_FILE_NOT_FOUND => "nu exista local",
             _ => "",
         }
     } else {
@@ -115,7 +136,8 @@ fn filetime(secs: i64) -> i64 {
 }
 
 fn metadata(dir: bool, size: u64, mtime: i64) -> CF_FS_METADATA {
-    let time = filetime(mtime);
+    // Serverul nu tine data directoarelor; aratam momentul in care le-am aflat.
+    let time = filetime(if dir && mtime == 0 { now() } else { mtime });
     CF_FS_METADATA {
         BasicInfo: FILE_BASIC_INFO {
             CreationTime: time,
@@ -183,23 +205,30 @@ impl Shared {
         Ok(())
     }
 
-    /// Fisierul s-a schimbat pe server: substituentul este golit si primeste noile date.
-    /// Daca are modificari locale neurcate, este lasat in pace (si se spune).
-    fn update(&self, entry: &Entry) -> Result<(), String> {
-        let path = wide_path(&self.local(&entry.path));
+    /// Deschide un fisier din director cu un handle potrivit pentru API-ul Cloud Files.
+    fn open(&self, path: &str, flags: CF_OPEN_FILE_FLAGS) -> Result<Opened, String> {
+        let wide = wide_path(&self.local(path));
         let mut handle: HANDLE = std::ptr::null_mut();
-        // SAFETY: `path` este un sir UTF-16 terminat cu zero; `handle` primeste rezultatul.
-        let hr = unsafe {
-            CfOpenFileWithOplock(path.as_ptr(), CF_OPEN_FILE_FLAG_WRITE_ACCESS | CF_OPEN_FILE_FLAG_EXCLUSIVE, &mut handle)
-        };
+        // SAFETY: `wide` este un sir UTF-16 terminat cu zero; `handle` primeste rezultatul.
+        let hr = unsafe { CfOpenFileWithOplock(wide.as_ptr(), flags, &mut handle) };
         check(hr, "deschidere")?;
+        Ok(Opened(handle))
+    }
+
+    /// Fisierul s-a schimbat pe server: substituentul este golit si primeste noile date.
+    /// Fara `force`, un fisier cu modificari locale neurcate este lasat in pace.
+    fn update(&self, entry: &Entry, force: bool) -> Result<(), String> {
+        let opened = self.open(&entry.path, CF_OPEN_FILE_FLAG_WRITE_ACCESS | CF_OPEN_FILE_FLAG_EXCLUSIVE)?;
         let meta = metadata(false, entry.size, entry.mtime);
         let identity = entry.path.as_bytes();
-        let flags = CF_UPDATE_FLAG_DEHYDRATE | CF_UPDATE_FLAG_MARK_IN_SYNC | CF_UPDATE_FLAG_VERIFY_IN_SYNC;
-        // SAFETY: handle-ul este valid (abia deschis); adresele traiesc pe durata apelului.
+        let mut flags = CF_UPDATE_FLAG_DEHYDRATE | CF_UPDATE_FLAG_MARK_IN_SYNC;
+        if !force {
+            flags |= CF_UPDATE_FLAG_VERIFY_IN_SYNC;
+        }
+        // SAFETY: handle-ul este valid; adresele traiesc pe durata apelului.
         let hr = unsafe {
             CfUpdatePlaceholder(
-                handle,
+                opened.0,
                 &meta,
                 identity.as_ptr().cast(),
                 identity.len() as u32,
@@ -210,12 +239,102 @@ impl Shared {
                 std::ptr::null_mut(),
             )
         };
-        // SAFETY: inchidem handle-ul primit de la CfOpenFileWithOplock, o singura data.
-        unsafe { CfCloseHandle(handle) };
         check(hr, "actualizare substituent")
     }
 
-    /// Aduce in disc ce s-a schimbat pe server.
+    /// Un fisier obisnuit, abia urcat, devine substituent (cu continutul pastrat local).
+    /// Daca era deja substituent (de exemplu mutat), doar identitatea si starea sunt innoite.
+    fn mark_synced(&self, path: &str) -> Result<(), String> {
+        let opened = self.open(path, CF_OPEN_FILE_FLAG_WRITE_ACCESS | CF_OPEN_FILE_FLAG_EXCLUSIVE)?;
+        let identity = path.as_bytes();
+        // SAFETY: handle valid; adresele traiesc pe durata apelului.
+        let hr = unsafe {
+            CfConvertToPlaceholder(
+                opened.0,
+                identity.as_ptr().cast(),
+                identity.len() as u32,
+                CF_CONVERT_FLAG_MARK_IN_SYNC,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if hr >= 0 {
+            return Ok(());
+        }
+        // SAFETY: ca mai sus.
+        let hr = unsafe {
+            CfUpdatePlaceholder(
+                opened.0,
+                std::ptr::null(),
+                identity.as_ptr().cast(),
+                identity.len() as u32,
+                std::ptr::null(),
+                0,
+                CF_UPDATE_FLAG_MARK_IN_SYNC,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        check(hr, "marcare ca sincronizat")
+    }
+
+    /// Identitatea unui substituent (calea de la creare); None pentru un fisier obisnuit.
+    fn identity(&self, path: &str) -> Option<String> {
+        let opened = self.open(path, CF_OPEN_FILE_FLAG_NONE).ok()?;
+        let mut buffer = vec![0u8; std::mem::size_of::<CF_PLACEHOLDER_BASIC_INFO>() + 4096];
+        let mut returned = 0u32;
+        // SAFETY: tamponul are loc pentru structura si pentru o identitate de cel mult 4 KB.
+        let hr = unsafe {
+            CfGetPlaceholderInfo(
+                opened.0,
+                CF_PLACEHOLDER_INFO_BASIC,
+                buffer.as_mut_ptr().cast(),
+                buffer.len() as u32,
+                &mut returned,
+            )
+        };
+        if hr < 0 {
+            return None;
+        }
+        // SAFETY: structura a fost scrisa de API la inceputul tamponului.
+        let info = unsafe { &*(buffer.as_ptr() as *const CF_PLACEHOLDER_BASIC_INFO) };
+        let start = std::mem::offset_of!(CF_PLACEHOLDER_BASIC_INFO, FileIdentity);
+        let end = start + info.FileIdentityLength as usize;
+        buffer.get(start..end).map(|b| String::from_utf8_lossy(b).into_owned())
+    }
+
+    /// Aplica o schimbare venita de pe server pentru un fisier pe care il stim deja.
+    fn apply_update(&self, entry: &Entry, force: bool) -> Result<(), String> {
+        let r = self.update(entry, force);
+        if r.is_ok() {
+            (self.log)(&format!("innoit    {}", entry.path));
+        }
+        r
+    }
+
+    fn record(&self, entry: &Entry) {
+        let mut state = self.state();
+        state.held.remove(&entry.path);
+        state.files.insert(
+            entry.path.clone(),
+            Known {
+                dir: entry.dir,
+                size: entry.size,
+                hash: entry.hash.clone(),
+                mtime: entry.mtime,
+                version: entry.version,
+            },
+        );
+    }
+
+    fn save(&self) {
+        let state = self.state();
+        if let Err(e) = state.save(&self.state_path) {
+            (self.log)(&format!("EROARE    {e}"));
+        }
+    }
+
+    /// Aduce in disc ce s-a schimbat pe server (si ce a ramas neaplicat data trecuta).
     fn refresh(&self) -> Result<usize, Fail> {
         let cursor = self.state().cursor;
         let (entries, new_cursor) = self.api.changes(cursor)?;
@@ -225,6 +344,7 @@ impl Shared {
         deleted.sort_by(|a, b| b.path.cmp(&a.path));
         live.sort_by(|a, b| a.path.cmp(&b.path));
         for entry in deleted {
+            self.state().held.remove(&entry.path);
             let known = self.state().files.get(&entry.path).cloned();
             let Some(known) = known else { continue };
             let local = self.local(&entry.path);
@@ -240,18 +360,14 @@ impl Shared {
             self.state().files.remove(&entry.path);
             changed += 1;
         }
-        for entry in live {
+        // Ce a ramas neaplicat data trecuta se incearca din nou, inaintea noutatilor.
+        let held: Vec<Entry> = self.state().held.values().cloned().collect();
+        for entry in held.into_iter().chain(live) {
             let known = self.state().files.get(&entry.path).cloned();
             let result = match known {
                 Some(k) if k.dir && entry.dir => Ok(()),
                 Some(k) if !k.dir && !entry.dir && k.version == entry.version => Ok(()),
-                Some(k) if !k.dir && !entry.dir => {
-                    let r = self.update(&entry);
-                    if r.is_ok() {
-                        (self.log)(&format!("innoit    {}", entry.path));
-                    }
-                    r
-                }
+                Some(k) if !k.dir && !entry.dir => self.apply_update(&entry, k.version == -1),
                 Some(k) => {
                     // Si-a schimbat felul (fisier <-> director): il facem din nou.
                     let local = self.local(&entry.path);
@@ -268,23 +384,248 @@ impl Shared {
             };
             match result {
                 Ok(()) => {
-                    self.state().files.insert(
-                        entry.path.clone(),
-                        Known { dir: entry.dir, size: entry.size, hash: entry.hash, mtime: entry.mtime, version: entry.version },
-                    );
+                    self.record(&entry);
                     changed += 1;
                 }
-                Err(e) => (self.log)(&format!("EROARE    {}: {e}", entry.path)),
+                Err(e) => {
+                    let mut state = self.state();
+                    if !state.held.contains_key(&entry.path) {
+                        (self.log)(&format!("amanat    {}: {e}", entry.path));
+                    }
+                    state.held.insert(entry.path.clone(), entry);
+                }
             }
         }
-        {
-            let mut state = self.state();
-            state.cursor = new_cursor;
-            if let Err(e) = state.save(&self.state_path) {
-                (self.log)(&format!("EROARE    {e}"));
-            }
-        }
+        self.state().cursor = new_cursor;
+        self.save();
         Ok(changed)
+    }
+
+    /// Spune o data ca un lucru este amanat; a doua oara tace.
+    fn later(&self, path: &str, why: &str) {
+        if self.quiet.lock().unwrap_or_else(|e| e.into_inner()).insert(path.to_string()) {
+            (self.log)(&format!("amanat    {path} ({why})"));
+        }
+    }
+
+    fn done(&self, path: &str) {
+        self.quiet.lock().unwrap_or_else(|e| e.into_inner()).remove(path);
+    }
+
+    /// Urca pe server ce s-a schimbat in director: fisiere noi sau modificate, stergeri, mutari.
+    fn push(&self) {
+        let found = match scan::scan(&self.root) {
+            Ok(found) => found,
+            Err(e) => {
+                (self.log)(&format!("EROARE    nu pot citi {}: {e}", self.root.display()));
+                return;
+            }
+        };
+        let mut changed = false;
+
+        // 1. Mutari: un substituent necunoscut la calea de acum, a carui identitate este o cale
+        //    pe care o stim si care nu mai exista pe disc. (Un director mutat este tratat
+        //    primul, iar copiii lui ajung astfel cunoscuti sub noile cai.)
+        for path in found.keys() {
+            if self.state().files.contains_key(path) {
+                continue;
+            }
+            let Some(old) = self.identity(path) else { continue };
+            if old == *path || found.contains_key(&old) || !self.state().files.contains_key(&old) {
+                continue;
+            }
+            match self.api.rename(&old, path) {
+                Ok(()) => {
+                    (self.log)(&format!("mutat     {old} -> {path}"));
+                    let mut state = self.state();
+                    let moved: Vec<String> = state
+                        .files
+                        .keys()
+                        .filter(|k| *k == &old || k.starts_with(&format!("{old}/")))
+                        .cloned()
+                        .collect();
+                    for from in moved {
+                        let to = format!("{path}{}", &from[old.len()..]);
+                        if let Some(mut k) = state.files.remove(&from) {
+                            // Versiunile de la noua cale se afla de pe server.
+                            if !k.dir {
+                                k.version = -1;
+                            }
+                            state.files.insert(to.clone(), k);
+                        }
+                        state.held.remove(&from);
+                        state.aliases.insert(from, to);
+                    }
+                    changed = true;
+                }
+                Err(e) => (self.log)(&format!("EROARE    {old} -> {path}: {e}")),
+            }
+        }
+        let known: BTreeMap<String, Known> = self.state().files.clone();
+
+        // 2. Fisiere noi si modificate, de sus in jos.
+        let settle = now() - 2;
+        for (path, local) in &found {
+            match known.get(path) {
+                Some(k) if k.dir && local.dir => {}
+                Some(k) if !k.dir && !local.dir && k.size == local.size && k.mtime == local.mtime => {}
+                Some(k) if !k.dir && !local.dir => {
+                    if local.mtime > settle {
+                        self.later(path, "inca se scrie");
+                        continue;
+                    }
+                    if k.version < 0 {
+                        self.later(path, "abia mutat; astept versiunea de pe server");
+                        continue;
+                    }
+                    if self.upload(path, local, k.version) {
+                        changed = true;
+                    }
+                }
+                Some(_) => {
+                    // Fisier devenit director sau invers: serverul afla la trecerea urmatoare,
+                    // dupa ce stergerea vechiului nume a fost trimisa.
+                }
+                None if local.dir => match self.api.mkdir(path) {
+                    Ok(()) => {
+                        (self.log)(&format!("creat     {path}/"));
+                        let _ = self.mark_synced(path);
+                        self.state().files.insert(
+                            path.clone(),
+                            Known { dir: true, size: 0, hash: String::new(), mtime: 0, version: 0 },
+                        );
+                        changed = true;
+                    }
+                    Err(e) => (self.log)(&format!("EROARE    {path}: {e}")),
+                },
+                None => {
+                    if local.mtime > settle {
+                        self.later(path, "inca se scrie");
+                        continue;
+                    }
+                    if self.upload(path, local, 0) {
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        // 3. Stergeri, de jos in sus, cu protectie la stergerile in masa.
+        let missing: Vec<(String, Known)> = known
+            .iter()
+            .filter(|(p, _)| !found.contains_key(*p))
+            .map(|(p, k)| (p.clone(), k.clone()))
+            .rev()
+            .collect();
+        if missing.len() > 50 && missing.len() * 2 > known.len() && !self.allow_mass_delete {
+            self.later(
+                "",
+                &format!(
+                    "{} din {} fisiere si directoare lipsesc local si ar fi sterse de pe server; \
+                     daca le-ai sters intentionat, porneste din nou cu --allow-mass-delete",
+                    missing.len(),
+                    known.len()
+                ),
+            );
+        } else {
+            for (path, k) in missing {
+                match self.api.delete(&path, None) {
+                    Ok(()) => {
+                        (self.log)(&format!("sters     {path} (de pe server)"));
+                        let mut state = self.state();
+                        state.files.remove(&path);
+                        state.held.remove(&path);
+                        changed = true;
+                    }
+                    Err(Fail::Refused(m)) if m.starts_with("409") && k.dir => {
+                        self.later(&path, "directorul nu este gol pe server");
+                    }
+                    Err(e) => (self.log)(&format!("EROARE    {path}: {e}")),
+                }
+            }
+        }
+        if changed {
+            self.save();
+        }
+    }
+
+    /// Urca un fisier local. Intoarce true daca s-a schimbat ceva de tinut minte.
+    fn upload(&self, path: &str, local: &Local, if_version: i64) -> bool {
+        let file = self.local(path);
+        match self.api.upload(path, &file, local.size, local.mtime, if_version) {
+            Ok((version, hash)) => {
+                (self.log)(&format!("urcat     {path}"));
+                if let Err(e) = self.mark_synced(path) {
+                    (self.log)(&format!("EROARE    {path}: {e}"));
+                }
+                self.done(path);
+                let mut state = self.state();
+                state.held.remove(path);
+                state.files.insert(
+                    path.to_string(),
+                    Known { dir: false, size: local.size, hash, mtime: local.mtime, version },
+                );
+                true
+            }
+            Err(Fail::Conflict) => self.conflict(path, local),
+            Err(e) => {
+                (self.log)(&format!("EROARE    {path}: {e}"));
+                false
+            }
+        }
+    }
+
+    /// Fisierul s-a schimbat si pe server: versiunea locala este urcata sub alt nume,
+    /// iar sub numele original este adusa versiunea de pe server.
+    fn conflict(&self, path: &str, local: &Local) -> bool {
+        // Schimbarea de pe server trebuie sa fie cunoscuta (ramane in `held`, fiindca
+        // fisierul este modificat local).
+        let _ = self.refresh();
+        let held = self.state().held.get(path).cloned();
+        let Some(entry) = held else {
+            (self.log)(&format!("EROARE    {path}: versiune schimbata pe server, dar nu o vad inca; reincerc"));
+            return false;
+        };
+        let kept = self.conflict_name(path);
+        let file = self.local(path);
+        let (version, hash) = match self.api.upload(&kept, &file, local.size, local.mtime, 0) {
+            Ok(result) => result,
+            Err(e) => {
+                (self.log)(&format!("EROARE    {kept}: {e}"));
+                return false;
+            }
+        };
+        (self.log)(&format!("CONFLICT  {path}: versiunea locala pastrata ca \"{kept}\""));
+        self.state().files.insert(
+            kept.clone(),
+            Known { dir: false, size: local.size, hash, mtime: local.mtime, version },
+        );
+        // Copia de conflict exista deja pe server; substituentul ei apare la urmatoarea trecere.
+        match self.update(&entry, true) {
+            Ok(()) => self.record(&entry),
+            Err(e) => (self.log)(&format!("amanat    {path}: {e}")),
+        }
+        self.done(path);
+        true
+    }
+
+    fn conflict_name(&self, path: &str) -> String {
+        let (dir, base) = match path.rfind('/') {
+            Some(i) => (&path[..=i], &path[i + 1..]),
+            None => ("", path),
+        };
+        let (stem, ext) = match base.rfind('.') {
+            Some(i) if i > 0 => (&base[..i], &base[i..]),
+            _ => (base, ""),
+        };
+        let label = format!("conflict {} {}", date(now()), self.host);
+        let mut candidate = format!("{dir}{stem} ({label}){ext}");
+        let mut n = 2;
+        while self.local(&candidate).exists() || self.state().files.contains_key(&candidate) {
+            candidate = format!("{dir}{stem} ({label} {n}){ext}");
+            n += 1;
+        }
+        candidate
     }
 
     fn temp(&self) -> PathBuf {
@@ -422,7 +763,14 @@ impl Shared {
     fn fetch(self: &Arc<Self>, request: Fetch) {
         let shared = self.clone();
         std::thread::spawn(move || {
-            let known = shared.state().files.get(&request.path).cloned();
+            // Identitatea este calea de la creare; dupa o mutare, calea de acum este alta.
+            let (path, known) = {
+                let state = shared.state();
+                let path = state.aliases.get(&request.path).cloned().unwrap_or_else(|| request.path.clone());
+                let known = state.files.get(&path).cloned();
+                (path, known)
+            };
+            let request = Fetch { path, ..request };
             let Some(known) = known else {
                 (shared.log)(&format!("EROARE    {}: fisier necunoscut", request.path));
                 shared.transfer(&request, None);
@@ -436,6 +784,16 @@ impl Shared {
                 }
             }
         });
+    }
+}
+
+/// Un handle primit de la CfOpenFileWithOplock, inchis automat.
+struct Opened(HANDLE);
+
+impl Drop for Opened {
+    fn drop(&mut self) {
+        // SAFETY: handle-ul a fost primit de la CfOpenFileWithOplock si se inchide o singura data.
+        unsafe { CfCloseHandle(self.0) };
     }
 }
 
@@ -520,7 +878,15 @@ pub fn unregister(target: &Path) -> Result<(), String> {
 }
 
 /// Porneste fisierele virtuale si ramane pornit pana la Ctrl+C.
-pub fn run(api: Api, home: &Path, target: &Path, cache_limit: u64, log: fn(&str)) -> Result<(), String> {
+pub fn run(
+    api: Api,
+    home: &Path,
+    target: &Path,
+    cache_limit: u64,
+    host: String,
+    allow_mass_delete: bool,
+    log: fn(&str),
+) -> Result<(), String> {
     let mut platform = CF_PLATFORM_INFO { BuildNumber: 0, RevisionNumber: 0, IntegrationNumber: 0 };
     // SAFETY: `platform` primeste rezultatul.
     if unsafe { CfGetPlatformInfo(&mut platform) } < 0 {
@@ -551,6 +917,9 @@ pub fn run(api: Api, home: &Path, target: &Path, cache_limit: u64, log: fn(&str)
         cache,
         cache_limit,
         counter: AtomicU64::new(0),
+        host,
+        allow_mass_delete,
+        quiet: Mutex::new(HashSet::new()),
         log,
     });
     SHARED.set(shared.clone()).map_err(|_| "pornit de doua ori".to_string())?;
@@ -567,7 +936,10 @@ pub fn run(api: Api, home: &Path, target: &Path, cache_limit: u64, log: fn(&str)
     check(hr, &format!("nu ma pot lega de {}", root.display()))?;
 
     match shared.refresh() {
-        Ok(n) => log(&format!("Fisiere virtuale in {} ({n} schimbari la pornire). Ctrl+C opreste.", root.display())),
+        Ok(n) => {
+            log(&format!("Fisiere virtuale in {} ({n} schimbari la pornire). Ctrl+C opreste.", root.display()));
+            shared.push();
+        }
         Err(e) => log(&format!("Fisiere virtuale in {}; serverul nu raspunde acum ({e}). Ctrl+C opreste.", root.display())),
     }
 
@@ -585,6 +957,7 @@ pub fn run(api: Api, home: &Path, target: &Path, cache_limit: u64, log: fn(&str)
                         log("serverul raspunde din nou");
                         down = false;
                     }
+                    shared.push();
                 }
                 Err(e) => {
                     if !down {

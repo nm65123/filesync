@@ -1,12 +1,12 @@
 //! Legatura cu serverul filesync (HTTPS).
 
 use base64::Engine;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Entry {
     pub path: String,
     pub dir: bool,
@@ -223,7 +223,6 @@ impl Api {
     }
 
     /// Muta sau redenumeste pe server (un fisier existent la destinatie este inlocuit).
-    #[cfg(unix)]
     pub fn rename(&self, from: &str, to: &str) -> Result<(), Fail> {
         let url = format!("{}/api/move", self.base);
         let body = serde_json::json!({ "from": from, "to": to }).to_string();

@@ -1,6 +1,8 @@
 //! filesync-client: tine un director local la fel cu spatiul unui utilizator de pe server.
 
 mod api;
+#[cfg(windows)]
+mod cloud;
 #[cfg(unix)]
 mod mount;
 mod scan;
@@ -39,6 +41,11 @@ filesync-client status           arata configuratia si ce stie clientul
 filesync-client mount DIRECTOR [--cache-size 5G]
                                  (Linux, macOS) disc virtual: fisierele apar fara sa ocupe
                                  spatiu si sunt aduse la deschidere
+filesync-client cloud DIRECTOR [--cache-size 5G]
+                                 (Windows) fisiere virtuale, ca OneDrive: apar in Explorer fara
+                                 sa ocupe spatiu si sunt aduse la deschidere
+filesync-client cloud DIRECTOR --unregister
+                                 (Windows) scoate directorul dintre fisierele virtuale
 filesync-client autostart on|off
                                  (Windows) porneste clientul singur, in fundal, la autentificare
 
@@ -387,8 +394,30 @@ fn start() -> Res<()> {
             }
             #[cfg(not(unix))]
             {
-                let _ = parse_size;
-                Err("mount este pentru Linux si macOS. Pe Windows fisierele virtuale vor folosi alt mecanism.".into())
+                Err("mount este pentru Linux si macOS. Pe Windows foloseste: filesync-client cloud DIRECTOR".into())
+            }
+        }
+        "cloud" => {
+            #[cfg(windows)]
+            {
+                let target = args
+                    .get(1)
+                    .filter(|a| !a.starts_with("--"))
+                    .ok_or("lipseste directorul pentru fisierele virtuale")?;
+                if args.iter().any(|a| a == "--unregister") {
+                    return cloud::unregister(Path::new(target));
+                }
+                let limit = match option(&args, "--cache-size") {
+                    Some(text) => parse_size(&text).ok_or("--cache-size: foloseste 5G, 500M...")?,
+                    None => 5 << 30,
+                };
+                let (_, api) = load(&home)?;
+                let _guard = lock(&home)?;
+                cloud::run(api, &home, Path::new(target), limit, out)
+            }
+            #[cfg(not(windows))]
+            {
+                Err("cloud este pentru Windows. Pe Linux si macOS foloseste: filesync-client mount DIRECTOR".into())
             }
         }
         "help" | "--help" | "-h" => {

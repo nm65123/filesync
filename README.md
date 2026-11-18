@@ -14,8 +14,9 @@ Files only: no calendar, no contacts, no office suite.
 - Original file dates are kept when the client sends them (rclone does).
 - A sync client (`filesync-client`) keeps a local directory identical with
   the server, in both directions.
-- On Linux and macOS the client can also mount the server as a virtual
-  drive: files take no local space and are fetched when opened.
+- The client can also show the server as virtual files that take no local
+  space and are fetched when opened: a mounted drive on Linux and macOS,
+  Files On-Demand style placeholders (as in OneDrive) on Windows.
 - Public share links for a file or a directory, optionally with a password
   and an expiry date.
 - Every file and directory is indexed in PostgreSQL (size, BLAKE3 hash, date,
@@ -430,7 +431,9 @@ filesync-client status
 
 `--interval N` changes the pause. `--profile NAME` (on every command) lets
 one computer sync several directories or accounts. Only one client can run
-per profile; a second one refuses to start.
+per profile; a second one refuses to start. `filesync-client stop` stops the
+client of a profile wherever it runs (a background one included) and waits
+until it has finished cleanly.
 
 **In the background.** On Windows:
 
@@ -441,7 +444,8 @@ per profile; a second one refuses to start.
 The client then starts by itself at every sign-in, without a window, and
 writes what it does to `%APPDATA%\filesync-client\default\client.log`. Do
 not move the program afterwards (or run `autostart on` again from its new
-place).
+place). A profile set up for virtual files (4.7) is started with `cloud`
+instead of `run`.
 
 On Linux, as a systemd user service:
 
@@ -546,8 +550,71 @@ How it behaves:
 - Without a connection you still see the list and can open cached files;
   other files cannot be opened until the server is back.
 
-Use a different profile for the drive than for a synced directory. The
-virtual drive has been tested on Linux only so far.
+Use a different profile for the drive than for a synced directory.
+`filesync-client stop --profile drive` unmounts it from another window.
+
+### 4.7 Virtual files on Windows
+
+On Windows the client uses the Cloud Files API, the mechanism behind
+OneDrive's *Files On-Demand*. A normal NTFS directory is registered as a
+sync root; every file on the server appears in it as a placeholder with its
+name, size and date but no content, and the content is downloaded the first
+time a program opens it. Explorer shows the state of each file in the
+*Status* column: a cloud for files not yet downloaded, a green check mark for
+files available locally. Needs Windows 10 version 1709 or newer.
+
+Unlike the mounted drive, the placeholders are real entries on disk and stay
+there when the client is not running: files already downloaded can still be
+opened, the others cannot until the client runs again.
+
+**Connect** a profile without `--dir` (certificate and token as in 4.2):
+
+```powershell
+.\filesync-client.exe setup --profile cloud --url https://192.168.0.48:8443 `
+    --user alice --ca-cert $HOME\filesync.crt
+```
+
+**Start:**
+
+```powershell
+.\filesync-client.exe cloud $HOME\Filesync --profile cloud
+```
+
+The directory and the options are remembered, so later runs need only
+`cloud --profile cloud`. Options:
+
+- `--cache-size 20G`: limit of the local copy of downloaded content (default
+  5G).
+- `--free-after DAYS`: a downloaded file that has not been opened for that
+  many days is emptied again and goes back to a cloud icon (default 30; `0`
+  never).
+- `--log FILE`, `--allow-mass-delete`: as for `run`.
+
+**In the background:** `autostart on --profile cloud` starts it at every
+sign-in; `stop --profile cloud` stops it.
+
+**Remove:** `cloud --unregister --profile cloud` removes the registration;
+delete the directory afterwards (placeholders without content cannot be
+opened any more).
+
+How it behaves:
+
+- New, changed and deleted files on the server show up within ten seconds.
+  A changed file is emptied and downloaded again when opened.
+- Files you create, change, delete, rename or move in the directory are
+  uploaded, deleted, renamed or moved on the server within ten seconds;
+  a new file becomes a placeholder with its content kept locally. Renames
+  transfer nothing.
+- If a file was changed on both sides, your version is uploaded as
+  `name (conflict date computer).ext` and the name keeps the server's
+  version.
+- A file that is open in a program, or that was changed locally and not
+  uploaded yet, is never overwritten or emptied; the server's change waits.
+- The same mass-delete protection as `run` applies.
+- Temporary files of editors stay local and are never uploaded.
+- The Explorer icons and the entry in the navigation pane come from a second,
+  shell-level registration. If Windows refuses it, the client says so at
+  start and works the same without icons.
 
 ---
 
@@ -616,16 +683,16 @@ Back up the data directory and the database together.
   round (no file-system notifications yet); only one client per profile may
   run at a time; names that differ only in letter case are not handled on
   Windows and macOS.
-- Virtual drive: Linux and macOS only (Windows is planned); a file is
-  downloaded whole before it can be read; the reported free space is not the
-  real quota.
+- Virtual drive and virtual files: a file is downloaded whole before it can
+  be read; the reported free space of the drive is not the real quota. The
+  virtual files have been tested on Windows 10 1809 only so far.
 - Share links: wrong passwords are not rate-limited, and a shared directory
   cannot be downloaded as a single archive.
 - The group and administrator flag are stored but not used yet.
 - Server messages are in Romanian.
 
-Planned: virtual files on Windows (Cloud Files API), delta transfers (rsync
-algorithm).
+Planned: delta transfers (rsync algorithm), file-system notifications instead
+of scanning, a web interface.
 
 ## License
 

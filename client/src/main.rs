@@ -38,9 +38,10 @@ filesync-client once             o sincronizare, apoi se opreste
 filesync-client run [--interval SECUNDE]
                                  sincronizeaza continuu (implicit la 10 secunde)
 filesync-client status           arata configuratia si ce stie clientul
-filesync-client mount DIRECTOR [--cache-size 5G]
+filesync-client mount [DIRECTOR] [--cache-size 5G]
                                  (Linux, macOS) disc virtual: fisierele apar fara sa ocupe
-                                 spatiu si sunt aduse la deschidere
+                                 spatiu si sunt aduse la deschidere. Directorul si optiunile
+                                 sunt tinute minte pentru data viitoare.
 filesync-client cloud [DIRECTOR] [--cache-size 5G] [--free-after ZILE]
                                  (Windows) fisiere virtuale, ca OneDrive: apar in Explorer fara
                                  sa ocupe spatiu si sunt aduse la deschidere; cele nedeschise
@@ -49,8 +50,9 @@ filesync-client cloud [DIRECTOR] [--cache-size 5G] [--free-after ZILE]
 filesync-client cloud --unregister
                                  (Windows) scoate directorul dintre fisierele virtuale
 filesync-client autostart on|off
-                                 (Windows) porneste clientul singur, in fundal, la autentificare
-                                 (`run` sau `cloud`, dupa cum este folosit profilul)
+                                 porneste clientul singur, in fundal, la autentificare
+                                 (`run`, `cloud` sau `mount`, dupa cum este folosit profilul);
+                                 Windows: Startup, macOS: LaunchAgent, Linux: systemd --user
 filesync-client stop             opreste clientul care ruleaza in fundal pe acest profil
 
 Optiuni comune:
@@ -74,6 +76,11 @@ struct Config {
     cloud_cache_size: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cloud_free_after_days: Option<i64>,
+    /// (Linux, macOS) directorul discului virtual, tinut minte de la prima rulare a lui `mount`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mount_dir: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mount_cache_size: Option<u64>,
 }
 
 impl Config {
@@ -151,49 +158,155 @@ fn lock(home: &Path) -> Res<std::fs::File> {
 
 /// Pornire automata pe Windows: un mic script in dosarul Startup, care lanseaza
 /// clientul fara fereastra, cu jurnalul scris in fisier.
-fn autostart(home: &Path, profile: &str, args: &[String]) -> Res<()> {
-    if !cfg!(windows) {
-        return Err("autostart este pentru Windows. Pe Linux foloseste un serviciu systemd de utilizator (vezi README).".into());
+/// Ce comanda porneste automat un profil, dupa cum este folosit.
+fn autostart_command(config: &Config) -> Res<&'static str> {
+    match (&config.cloud_dir, &config.mount_dir, &config.dir) {
+        (Some(_), _, _) if cfg!(windows) => Ok("cloud"),
+        (_, Some(_), _) if cfg!(unix) => Ok("mount"),
+        (_, _, Some(_)) => Ok("run"),
+        _ => Err("profilul nu are nici director de sincronizat, nici fisiere virtuale; ruleaza intai `setup --dir`, `mount DIRECTOR` sau `cloud DIRECTOR`".into()),
     }
-    let startup = PathBuf::from(std::env::var("APPDATA").map_err(|_| "lipseste variabila APPDATA")?)
-        .join("Microsoft")
-        .join("Windows")
-        .join("Start Menu")
-        .join("Programs")
-        .join("Startup")
-        .join(format!("filesync-client-{profile}.vbs"));
-    match args.get(1).map(String::as_str) {
-        Some("on") => {
-            let (config, _) = load(home)?; // trebuie sa existe o configuratie
-            let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-            let log = home.join("client.log");
-            // Un profil folosit pentru fisiere virtuale porneste `cloud`; altfel `run`.
-            let command = match (&config.cloud_dir, &config.dir) {
-                (Some(_), _) => "cloud",
-                (None, Some(_)) => "run",
-                (None, None) => return Err("profilul nu are nici director de sincronizat, nici fisiere virtuale; ruleaza intai `setup --dir` sau `cloud DIRECTOR`".into()),
-            };
-            let script = format!(
-                "CreateObject(\"WScript.Shell\").Run \"\"\"{}\"\" {command} --profile {profile} --log \"\"{}\"\"\", 0, False\r\n",
-                exe.display(),
-                log.display()
-            );
-            std::fs::write(&startup, script).map_err(|e| format!("nu pot scrie {}: {e}", startup.display()))?;
-            let _ = std::process::Command::new("wscript.exe").arg(&startup).spawn();
-            println!("Clientul ({command}) porneste de acum singur la autentificare, in fundal.");
-            println!("Program: {}  (nu il muta; daca il muti, ruleaza din nou `autostart on`)", exe.display());
-            println!("Jurnal:  {}", log.display());
-            Ok(())
-        }
-        Some("off") => {
+}
+
+fn autostart(home: &Path, profile: &str, args: &[String]) -> Res<()> {
+    let on = match args.get(1).map(String::as_str) {
+        Some("on") => true,
+        Some("off") => false,
+        _ => return Err("foloseste: filesync-client autostart on|off".into()),
+    };
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    if cfg!(windows) {
+        let startup = PathBuf::from(std::env::var("APPDATA").map_err(|_| "lipseste variabila APPDATA")?)
+            .join("Microsoft")
+            .join("Windows")
+            .join("Start Menu")
+            .join("Programs")
+            .join("Startup")
+            .join(format!("filesync-client-{profile}.vbs"));
+        if !on {
             match std::fs::remove_file(&startup) {
                 Ok(()) => println!("Pornirea automata a fost scoasa. Clientul care ruleaza acum se opreste la deconectare."),
                 Err(_) => println!("Pornirea automata nu era activa."),
             }
-            Ok(())
+            return Ok(());
         }
-        _ => Err("foloseste: filesync-client autostart on|off".into()),
+        let (config, _) = load(home)?;
+        let command = autostart_command(&config)?;
+        let log = home.join("client.log");
+        let script = format!(
+            "CreateObject(\"WScript.Shell\").Run \"\"\"{}\"\" {command} --profile {profile} --log \"\"{}\"\"\", 0, False\r\n",
+            exe.display(),
+            log.display()
+        );
+        std::fs::write(&startup, script).map_err(|e| format!("nu pot scrie {}: {e}", startup.display()))?;
+        let _ = std::process::Command::new("wscript.exe").arg(&startup).spawn();
+        println!("Clientul ({command}) porneste de acum singur la autentificare, in fundal.");
+        println!("Program: {}  (nu il muta; daca il muti, ruleaza din nou `autostart on`)", exe.display());
+        println!("Jurnal:  {}", log.display());
+        return Ok(());
     }
+    let user_home = PathBuf::from(std::env::var("HOME").map_err(|_| "lipseste variabila HOME")?);
+    if cfg!(target_os = "macos") {
+        let label = format!("ro.filesync.{profile}");
+        let plist = user_home.join("Library").join("LaunchAgents").join(format!("{label}.plist"));
+        let log = user_home.join("Library").join("Logs").join(format!("filesync-client-{profile}.log"));
+        let uid = std::process::Command::new("id").arg("-u").output().ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .ok_or("nu pot afla uid-ul")?;
+        let domain = format!("gui/{uid}");
+        // Oprim ce era pornit sub aceasta eticheta (daca era).
+        let _ = std::process::Command::new("launchctl").args(["bootout", &format!("{domain}/{label}")])
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+        if !on {
+            match std::fs::remove_file(&plist) {
+                Ok(()) => println!("Pornirea automata a fost scoasa si clientul oprit."),
+                Err(_) => println!("Pornirea automata nu era activa."),
+            }
+            return Ok(());
+        }
+        let (config, _) = load(home)?;
+        let command = autostart_command(&config)?;
+        let content = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{exe}</string>
+        <string>{command}</string>
+        <string>--profile</string>
+        <string>{profile}</string>
+        <string>--log</string>
+        <string>{log}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+</dict>
+</plist>
+"#,
+            exe = exe.display(),
+            log = log.display()
+        );
+        if let Some(dir) = plist.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(&plist, content).map_err(|e| format!("nu pot scrie {}: {e}", plist.display()))?;
+        let status = std::process::Command::new("launchctl").args(["bootstrap", &domain]).arg(&plist).status()
+            .map_err(|e| format!("launchctl: {e}"))?;
+        if !status.success() {
+            return Err(format!("launchctl bootstrap a esuat pentru {}", plist.display()));
+        }
+        println!("Clientul ({command}) porneste de acum singur la autentificare, in fundal.");
+        println!("Program: {}  (nu il muta; daca il muti, ruleaza din nou `autostart on`)", exe.display());
+        println!("Jurnal:  {}", log.display());
+        println!("Oprire:  filesync-client autostart off --profile {profile}  (sau `stop`, pana la urmatoarea autentificare)");
+        return Ok(());
+    }
+    // Linux: serviciu systemd de utilizator.
+    let unit_name = format!("filesync-client-{profile}.service");
+    let unit = user_home.join(".config").join("systemd").join("user").join(&unit_name);
+    let systemctl = |args: &[&str]| std::process::Command::new("systemctl").arg("--user").args(args).status();
+    if !on {
+        let _ = systemctl(&["disable", "--now", &unit_name]);
+        match std::fs::remove_file(&unit) {
+            Ok(()) => {
+                let _ = systemctl(&["daemon-reload"]);
+                println!("Pornirea automata a fost scoasa si clientul oprit.");
+            }
+            Err(_) => println!("Pornirea automata nu era activa."),
+        }
+        return Ok(());
+    }
+    let (config, _) = load(home)?;
+    let command = autostart_command(&config)?;
+    let content = format!(
+        "[Unit]\nDescription=filesync client ({profile})\n\n[Service]\nExecStart={} {command} --profile {profile}\nRestart=on-failure\nRestartSec=30\n\n[Install]\nWantedBy=default.target\n",
+        exe.display()
+    );
+    if let Some(dir) = unit.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(&unit, content).map_err(|e| format!("nu pot scrie {}: {e}", unit.display()))?;
+    let ok = systemctl(&["daemon-reload"]).is_ok_and(|s| s.success())
+        && systemctl(&["enable", "--now", &unit_name]).is_ok_and(|s| s.success());
+    if !ok {
+        return Err("systemctl --user a esuat (exista systemd de utilizator?)".into());
+    }
+    println!("Clientul ({command}) porneste de acum singur la autentificare, in fundal.");
+    println!("Program: {}  (nu il muta; daca il muti, ruleaza din nou `autostart on`)", exe.display());
+    println!("Jurnal:  journalctl --user -u {unit_name}");
+    Ok(())
 }
 
 fn save_config(home: &Path, config: &Config) -> Res<()> {
@@ -262,6 +375,8 @@ fn setup(home: &Path, args: &[String]) -> Res<()> {
         cloud_dir: None,
         cloud_cache_size: None,
         cloud_free_after_days: None,
+        mount_dir: None,
+        mount_cache_size: None,
     };
     save_config(home, &config)?;
     #[cfg(unix)]
@@ -438,17 +553,27 @@ fn start() -> Res<()> {
         "mount" => {
             #[cfg(unix)]
             {
-                let target = args
-                    .get(1)
-                    .filter(|a| !a.starts_with("--"))
-                    .ok_or("lipseste directorul in care sa montez")?;
-                let limit = match option(&args, "--cache-size") {
-                    Some(text) => parse_size(&text).ok_or("--cache-size: foloseste 5G, 500M...")?,
-                    None => 5 << 30,
+                let (mut config, api) = load(&home)?;
+                let given = args.get(1).filter(|a| !a.starts_with("--")).map(PathBuf::from);
+                let target = match given.or_else(|| config.mount_dir.clone()) {
+                    Some(dir) => dir,
+                    None => return Err("lipseste directorul in care sa montez (prima data: filesync-client mount DIRECTOR)".into()),
                 };
-                let (_, api) = load(&home)?;
+                if let Some(text) = option(&args, "--cache-size") {
+                    config.mount_cache_size = Some(parse_size(&text).ok_or("--cache-size: foloseste 5G, 500M...")?);
+                }
+                let limit = config.mount_cache_size.unwrap_or(5 << 30);
                 let _guard = lock(&home)?;
-                mount::mount(api, &home, Path::new(target), limit, options.host.clone(), out)
+                std::fs::create_dir_all(&target).map_err(|e| format!("nu pot crea {}: {e}", target.display()))?;
+                // Calea absoluta, fara sa trecem prin director (ar putea fi o montare ramasa).
+                let absolute = if target.is_absolute() {
+                    target.clone()
+                } else {
+                    std::env::current_dir().map_err(|e| e.to_string())?.join(&target)
+                };
+                config.mount_dir = Some(absolute.clone());
+                save_config(&home, &config)?;
+                mount::mount(api, &home, &absolute, limit, options.host.clone(), out)
             }
             #[cfg(not(unix))]
             {

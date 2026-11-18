@@ -435,19 +435,23 @@ per profile; a second one refuses to start. `filesync-client stop` stops the
 client of a profile wherever it runs (a background one included) and waits
 until it has finished cleanly.
 
-**In the background.** On Windows:
+**In the background.** On every system:
 
-```powershell
-.\filesync-client.exe autostart on      # autostart off  undoes it
+```sh
+filesync-client autostart on      # autostart off  undoes it and stops the client
 ```
 
-The client then starts by itself at every sign-in, without a window, and
-writes what it does to `%APPDATA%\filesync-client\default\client.log`. Do
-not move the program afterwards (or run `autostart on` again from its new
-place). A profile set up for virtual files (4.7) is started with `cloud`
-instead of `run`.
+The client then starts by itself at every sign-in, without a window: on
+Windows through the Startup folder (log in
+`%APPDATA%\filesync-client\default\client.log`), on macOS through a
+LaunchAgent (`~/Library/LaunchAgents/ro.filesync.PROFILE.plist`, log in
+`~/Library/Logs/filesync-client-PROFILE.log`), on Linux through a systemd
+user service (`filesync-client-PROFILE.service`, log in `journalctl --user`).
+Do not move the program afterwards (or run `autostart on` again from its new
+place). A profile set up for a virtual drive (4.6) or virtual files (4.7) is
+started with `mount` or `cloud` instead of `run`.
 
-On Linux, as a systemd user service:
+The systemd unit written on Linux is equivalent to this:
 
 ```sh
 mkdir -p ~/.config/systemd/user
@@ -527,10 +531,13 @@ filesync-client setup --profile drive --url https://192.168.0.48:8443 \
 filesync-client mount ~/Filesync --profile drive
 ```
 
-The directory shows the server's content while the program runs; Ctrl+C (or
-`umount ~/Filesync`) unmounts it. `--cache-size 20G` sets the cache limit
-(default 5G); the least recently used files are dropped first. `--log FILE`
-writes the messages to a file.
+The directory shows the server's content while the program runs; Ctrl+C,
+`filesync-client stop --profile drive` or `umount ~/Filesync` unmounts it,
+and so does the sign-out or shutdown of the system. The directory and the
+options are remembered, so later runs need only `mount --profile drive`.
+`--cache-size 20G` sets the cache limit (default 5G); the least recently
+used files are dropped first. `--log FILE` writes the messages to a file.
+A mount left behind by a crash is removed at the next start.
 
 How it behaves:
 
@@ -551,7 +558,7 @@ How it behaves:
   other files cannot be opened until the server is back.
 
 Use a different profile for the drive than for a synced directory.
-`filesync-client stop --profile drive` unmounts it from another window.
+`autostart on --profile drive` mounts it at every sign-in (4.4).
 
 ### 4.7 Virtual files on Windows
 

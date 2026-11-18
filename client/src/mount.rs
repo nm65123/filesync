@@ -220,6 +220,8 @@ struct Shared {
     gid: u32,
     host: String,
     log: fn(&str),
+    /// FILESYNC_TRACE=1: scrie fiecare operatie primita de la sistem (pentru depanare).
+    trace: bool,
 }
 
 fn io_error(e: std::io::Error) -> Errno {
@@ -227,6 +229,12 @@ fn io_error(e: std::io::Error) -> Errno {
 }
 
 impl Shared {
+    fn trace(&self, what: &str, ino: u64, detail: &str) {
+        if self.trace {
+            (self.log)(&format!("fuse      {what} ino={ino} {detail}"));
+        }
+    }
+
     fn tree(&self) -> MutexGuard<'_, Tree> {
         self.tree.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -664,8 +672,9 @@ impl Filesystem for Drive {
         reply.opened(FileHandle(fh), FopenFlags::empty());
     }
 
-    fn create(&self, _req: &Request, parent: INodeNo, name: &OsStr, _mode: u32, _umask: u32, _flags: i32, reply: ReplyCreate) {
+    fn create(&self, _req: &Request, parent: INodeNo, name: &OsStr, _mode: u32, _umask: u32, flags: i32, reply: ReplyCreate) {
         let Some(name) = name.to_str() else { return reply.error(Errno::EINVAL) };
+        self.0.trace("create", parent.0, &format!("{name} flags={flags:#x}"));
         let staging = self.0.temp(&self.0.staging, "");
         let file = match File::options().read(true).write(true).create_new(true).open(&staging) {
             Ok(file) => file,
@@ -745,6 +754,7 @@ impl Filesystem for Drive {
     }
 
     fn release(&self, _req: &Request, ino: INodeNo, fh: FileHandle, _flags: OpenFlags, _lock: Option<LockOwner>, _flush: bool, reply: ReplyEmpty) {
+        self.0.trace("release", ino.0, &format!("fh={}", fh.0));
         let handle = self.0.handles().remove(&fh.0);
         if handle.is_some_and(|h| h.writable) {
             let _ = self.0.upload(ino.0); // daca nu reuseste, se reincearca in fundal
@@ -775,6 +785,7 @@ impl Filesystem for Drive {
         _flags: Option<fuser::BsdFileFlags>,
         reply: ReplyAttr,
     ) {
+        self.0.trace("setattr", ino.0, &format!("size={size:?} mtime={} fh={fh:?}", mtime.is_some()));
         if let Some(size) = size {
             if let Err(e) = self.truncate(ino.0, fh.map(|f| f.0), size) {
                 return reply.error(e);
@@ -823,6 +834,7 @@ impl Filesystem for Drive {
     }
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        self.0.trace("unlink", parent.0, &name.to_string_lossy());
         let found = {
             let tree = self.0.tree();
             name.to_str()
@@ -878,6 +890,7 @@ impl Filesystem for Drive {
         let (Some(name), Some(newname)) = (name.to_str(), newname.to_str()) else {
             return reply.error(Errno::EINVAL);
         };
+        self.0.trace("rename", parent.0, &format!("{name} -> {}/{newname}", newparent.0));
         let (ino, node, to, target_version) = {
             let tree = self.0.tree();
             let Some(ino) = tree.child(parent.0, name) else { return reply.error(Errno::ENOENT) };
@@ -1013,6 +1026,19 @@ pub fn mount(api: Api, home: &Path, mountpoint: &Path, cache_limit: u64, host: S
             }
         }
     }
+    // O montare ramasa de la o oprire brusca (programul omorat, pana de curent) ar face
+    // directorul de nefolosit: o scoatem.
+    if is_mounted(mountpoint) {
+        if unmount(mountpoint) {
+            log(&format!("o montare ramasa la {} a fost scoasa", mountpoint.display()));
+        } else {
+            return Err(format!(
+                "la {} este o montare ramasa pe care nu o pot scoate. Inchide ce o foloseste si ruleaza: umount {}",
+                mountpoint.display(),
+                mountpoint.display()
+            ));
+        }
+    }
     std::fs::create_dir_all(mountpoint).map_err(|e| format!("nu pot crea {}: {e}", mountpoint.display()))?;
 
     let shared = Arc::new(Shared {
@@ -1029,6 +1055,7 @@ pub fn mount(api: Api, home: &Path, mountpoint: &Path, cache_limit: u64, host: S
         gid: unsafe { libc::getgid() },
         host,
         log,
+        trace: std::env::var("FILESYNC_TRACE").is_ok(),
     });
     shared.refresh(true).map_err(|e| format!("nu pot citi lista de fisiere de pe server: {e}"))?;
 
@@ -1207,10 +1234,22 @@ fn receive_fd(socket: &OwnedFd) -> std::io::Result<OwnedFd> {
     }
 }
 
+/// Este ceva montat la aceasta cale? (alt dispozitiv decat parintele, sau un sistem de
+/// fisiere care nu mai raspunde)
+fn is_mounted(mountpoint: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Some(parent) = mountpoint.parent() else { return false };
+    match (std::fs::metadata(mountpoint), std::fs::metadata(parent)) {
+        (Ok(here), Ok(up)) => here.dev() != up.dev(),
+        (Err(e), _) => !matches!(e.kind(), std::io::ErrorKind::NotFound),
+        _ => false,
+    }
+}
+
 /// Demonteaza un disc montat pe calea directa.
 fn unmount(mountpoint: &Path) -> bool {
     let attempts: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
-        &[("umount", &[]), ("diskutil", &["unmount", "force"])]
+        &[("umount", &[]), ("diskutil", &["unmount", "force"]), ("umount", &["-f"])]
     } else {
         &[("fusermount3", &["-u"])]
     };

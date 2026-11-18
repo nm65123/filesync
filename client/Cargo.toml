@@ -9,7 +9,7 @@ blake3 = "1.8.7"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 ureq = "3.5.2"
-ctrlc = "3.5.2"
+ctrlc = { version = "3.5.2", features = ["termination"] }
 
 [target."cfg(unix)".dependencies]
 fuser = "0.18.0"

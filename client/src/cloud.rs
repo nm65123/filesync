@@ -842,7 +842,7 @@ impl Shared {
         })();
         match result {
             Ok(()) => {
-                (self.log)(&format!("adus      {}", request.path));
+                (self.log)(&format!("adus      {} (cerut de {})", request.path, request.who));
                 self.touched(&request.path);
             }
             Err(e) => {
@@ -896,6 +896,8 @@ struct Fetch {
     connection: CF_CONNECTION_KEY,
     transfer: i64,
     request: i64,
+    /// Programul care a cerut (daca sistemul ni l-a spus).
+    who: String,
 }
 
 /// Programele carora nu le aducem continut: indexarea Windows ar descarca tot directorul
@@ -911,8 +913,10 @@ unsafe extern "system" fn on_fetch_data(info: *const CF_CALLBACK_INFO, _params: 
         let identity = std::slice::from_raw_parts(info.FileIdentity.cast::<u8>(), info.FileIdentityLength as usize);
         (String::from_utf8_lossy(identity).into_owned(), info.ConnectionKey, info.TransferKey, info.RequestKey, caller(info))
     };
-    let request = Fetch { path, connection, transfer, request };
-    if who.as_deref().is_some_and(|w| NO_FETCH.contains(&w)) {
+    let who = who.unwrap_or_default();
+    let refused = NO_FETCH.contains(&who.as_str());
+    let request = Fetch { path, connection, transfer, request, who };
+    if refused {
         shared.transfer(&request, None);
         return;
     }

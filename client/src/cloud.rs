@@ -1172,11 +1172,34 @@ pub fn run(
     ctrlc::set_handler(move || flag.store(true, Ordering::SeqCst)).map_err(|e| e.to_string())?;
     let stop_file = home.join("stop");
     let _ = std::fs::remove_file(&stop_file);
+    // Notificarile de la sistem spun cand merita o scanare; fara ele, scanam la fiecare
+    // trecere; cu ele, o scanare completa ramane doar la 5 minute, ca plasa de siguranta.
+    let watcher = match crate::watch::Watch::new(&root) {
+        Ok(w) => Some(w),
+        Err(e) => {
+            log(&format!("fara notificari de la sistem ({e}); scanez la fiecare 10 secunde"));
+            None
+        }
+    };
+    let stop_asked = || stop.load(Ordering::SeqCst) || stop_file.exists();
     let mut last = Instant::now();
+    let mut last_push = Instant::now();
     let mut last_sweep = Instant::now();
     let mut down = false;
-    while !stop.load(Ordering::SeqCst) && !stop_file.exists() {
-        std::thread::sleep(Duration::from_millis(300));
+    loop {
+        let remaining = Duration::from_secs(10).saturating_sub(last.elapsed()).max(Duration::from_millis(200));
+        let wake = match &watcher {
+            Some(w) => w.wait(remaining, &stop_asked),
+            None => crate::watch::sleep(remaining, &stop_asked),
+        };
+        match wake {
+            crate::watch::Wake::Stop => break,
+            crate::watch::Wake::Changed => {
+                shared.push();
+                last_push = Instant::now();
+            }
+            crate::watch::Wake::Timeout => {}
+        }
         if last_sweep.elapsed() >= Duration::from_secs(600) {
             shared.free_space();
             last_sweep = Instant::now();
@@ -1188,7 +1211,10 @@ pub fn run(
                         log("serverul raspunde din nou");
                         down = false;
                     }
-                    shared.push();
+                    if watcher.is_none() || last_push.elapsed() >= Duration::from_secs(300) {
+                        shared.push();
+                        last_push = Instant::now();
+                    }
                 }
                 Err(e) => {
                     if !down {

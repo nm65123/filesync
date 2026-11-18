@@ -425,11 +425,16 @@ sync state is kept.
 
 ```sh
 filesync-client once         # one sync, then exit
-filesync-client run          # keeps syncing every 10 seconds; Ctrl+C stops
+filesync-client run          # keeps syncing; Ctrl+C stops
 filesync-client status
 ```
 
-`--interval N` changes the pause. `--profile NAME` (on every command) lets
+`run` watches the directory through the system's notifications (inotify,
+FSEvents, ReadDirectoryChangesW): a local change is synced about a second
+after it settles, and the server is checked at every round. A full scan is
+still made every 5 minutes as a safety net; `--interval N` changes that
+pause. Where notifications cannot be started, the client says so and scans
+every 10 seconds instead. `--profile NAME` (on every command) lets
 one computer sync several directories or accounts. Only one client can run
 per profile; a second one refuses to start. `filesync-client stop` stops the
 client of a profile wherever it runs (a background one included) and waits
@@ -615,7 +620,8 @@ How it behaves:
 - New, changed and deleted files on the server show up within ten seconds.
   A changed file is emptied and downloaded again when opened.
 - Files you create, change, delete, rename or move in the directory are
-  uploaded, deleted, renamed or moved on the server within ten seconds;
+  uploaded, deleted, renamed or moved on the server a second or two after
+  the change settles (system notifications; a full scan every 5 minutes);
   a new file becomes a placeholder with its content kept locally. Renames
   transfer nothing.
 - If a file was changed on both sides, your version is uploaded as
@@ -692,10 +698,8 @@ Back up the data directory and the database together.
 - A file uploaded through WebDAV is read once more after the upload, to
   compute its hash.
 - WebDAV `COPY` is not checked against the quota.
-- Sync client: it finds local changes by scanning the directory at every
-  round (no file-system notifications yet); only one client per profile may
-  run at a time; names that differ only in letter case are not handled on
-  Windows and macOS.
+- Sync client: only one client per profile may run at a time; names that
+  differ only in letter case are not handled on Windows and macOS.
 - Virtual drive and virtual files: a file is downloaded whole before it can
   be read; the reported free space of the drive is not the real quota. The
   virtual files have been tested on Windows 10 1809 only so far.
@@ -704,8 +708,7 @@ Back up the data directory and the database together.
 - The group and administrator flag are stored but not used yet.
 - Server messages are in Romanian.
 
-Planned: delta transfers (rsync algorithm), file-system notifications instead
-of scanning, a web interface.
+Planned: delta transfers (rsync algorithm), a web interface.
 
 ## License
 

@@ -8,6 +8,7 @@ mod mount;
 mod scan;
 mod state;
 mod sync;
+mod watch;
 
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -513,14 +514,32 @@ fn start() -> Res<()> {
         "run" => {
             let (config, api) = load(&home)?;
             let _guard = lock(&home)?;
-            let interval = option(&args, "--interval").and_then(|v| v.parse::<u64>().ok()).unwrap_or(10).max(1);
+            let dir = config.sync_dir()?.to_path_buf();
+            // Cu notificari de la sistem, scanarea completa ramane doar ca plasa de siguranta.
+            let watcher = match watch::Watch::new(&dir) {
+                Ok(w) => Some(w),
+                Err(e) => {
+                    out(&format!("fara notificari de la sistem ({e}); scanez periodic"));
+                    None
+                }
+            };
+            let interval = option(&args, "--interval")
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(if watcher.is_some() { 300 } else { 10 })
+                .max(1);
             out(&format!(
-                "Sincronizez {} cu {} la fiecare {interval} secunde.",
-                config.sync_dir()?.display(),
-                config.url
+                "Sincronizez {} cu {}: {}.",
+                dir.display(),
+                config.url,
+                if watcher.is_some() {
+                    format!("la fiecare schimbare, si o verificare completa la {interval} secunde")
+                } else {
+                    format!("la fiecare {interval} secunde")
+                }
             ));
             let stop_file = home.join("stop");
             let _ = std::fs::remove_file(&stop_file);
+            let stop = || stop_file.exists();
             let mut last_error = String::new();
             loop {
                 match sync(&home, &config, &api, &options) {
@@ -537,13 +556,16 @@ fn start() -> Res<()> {
                     }
                     Err(_) => {}
                 }
-                for _ in 0..interval * 5 {
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                    if stop_file.exists() {
-                        let _ = std::fs::remove_file(&stop_file);
-                        out("Oprit la cerere.");
-                        return Ok(());
-                    }
+                // Dupa o eroare (server oprit), reincercam oricum la 10 secunde.
+                let max = std::time::Duration::from_secs(if last_error.is_empty() { interval } else { 10.min(interval) });
+                let wake = match &watcher {
+                    Some(w) => w.wait(max, &stop),
+                    None => watch::sleep(max, &stop),
+                };
+                if wake == watch::Wake::Stop {
+                    let _ = std::fs::remove_file(&stop_file);
+                    out("Oprit la cerere.");
+                    return Ok(());
                 }
             }
         }

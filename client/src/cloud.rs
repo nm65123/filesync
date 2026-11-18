@@ -481,7 +481,12 @@ impl Shared {
             }
         }
         if freed > 0 {
-            (self.log)(&format!("eliberat  {freed} fisiere nedeschise de {} zile (raman vizibile)", self.free_after / 86_400));
+            let age = if self.free_after >= 86_400 {
+                format!("{} zile", self.free_after / 86_400)
+            } else {
+                format!("{} secunde", self.free_after)
+            };
+            (self.log)(&format!("eliberat  {freed} fisiere nedeschise de {age} (raman vizibile)"));
             self.save();
         }
     }
@@ -916,15 +921,50 @@ unsafe extern "system" fn on_cancel_fetch_data(info: *const CF_CALLBACK_INFO, _p
     (shared.log)(&format!("anulat    {} (descarcarea continua in fundal)", path));
 }
 
+/// Programele ale caror deschideri nu inseamna ca fisierul este folosit: Explorer (miniaturi,
+/// previzualizari), gazda de miniaturi, indexarea Windows si clientul insusi.
+const HOUSEKEEPING: &[&str] = &[
+    "explorer.exe",
+    "dllhost.exe",
+    "searchprotocolhost.exe",
+    "searchindexer.exe",
+    "searchfilterhost.exe",
+    "filesync-client.exe",
+    "filesync-cloud.exe",
+];
+
+/// Numele programului care a facut cererea (din informatiile despre proces), cu litere mici.
+unsafe fn caller(info: &CF_CALLBACK_INFO) -> Option<String> {
+    if info.ProcessInfo.is_null() {
+        return None;
+    }
+    // SAFETY: sistemul da o structura valida pe durata apelului, cu un sir terminat cu zero.
+    unsafe {
+        let process = &*info.ProcessInfo;
+        if process.ImagePath.is_null() {
+            return None;
+        }
+        let mut len = 0;
+        while *process.ImagePath.add(len) != 0 {
+            len += 1;
+        }
+        let path = String::from_utf16_lossy(std::slice::from_raw_parts(process.ImagePath, len));
+        Some(path.rsplit(['\\', '/']).next().unwrap_or(&path).to_ascii_lowercase())
+    }
+}
+
 /// Apelata de sistem dupa ce un program a deschis un fisier din director.
 unsafe extern "system" fn on_open_completion(info: *const CF_CALLBACK_INFO, _params: *const CF_CALLBACK_PARAMETERS) {
     let Some(shared) = SHARED.get() else { return };
     // SAFETY: ca la on_fetch_data.
-    let identity = unsafe {
+    let (identity, who) = unsafe {
         let info = &*info;
         let identity = std::slice::from_raw_parts(info.FileIdentity.cast::<u8>(), info.FileIdentityLength as usize);
-        String::from_utf8_lossy(identity).into_owned()
+        (String::from_utf8_lossy(identity).into_owned(), caller(info))
     };
+    if who.as_deref().is_some_and(|w| HOUSEKEEPING.contains(&w)) {
+        return;
+    }
     shared.touched(&identity);
 }
 
@@ -1097,6 +1137,10 @@ pub fn run(
     free_after: i64,
     log: fn(&str),
 ) -> Result<(), String> {
+    // Pentru teste: pragul in secunde, si verificarea la fiecare trecere.
+    let test_secs = std::env::var("FILESYNC_FREE_AFTER_SECS").ok().and_then(|v| v.parse::<i64>().ok());
+    let free_after = test_secs.unwrap_or(free_after);
+    let sweep_every = if test_secs.is_some() { Duration::from_secs(10) } else { Duration::from_secs(600) };
     let mut platform = CF_PLATFORM_INFO { BuildNumber: 0, RevisionNumber: 0, IntegrationNumber: 0 };
     // SAFETY: `platform` primeste rezultatul.
     if unsafe { CfGetPlatformInfo(&mut platform) } < 0 {
@@ -1155,7 +1199,9 @@ pub fn run(
     let path = wide_path(&root);
     let mut connection: CF_CONNECTION_KEY = 0;
     // SAFETY: tabelul se incheie cu CF_CALLBACK_TYPE_NONE; `connection` primeste cheia.
-    let hr = unsafe { CfConnectSyncRoot(path.as_ptr(), callbacks.as_ptr(), std::ptr::null(), CF_CONNECT_FLAG_NONE, &mut connection) };
+    let hr = unsafe {
+        CfConnectSyncRoot(path.as_ptr(), callbacks.as_ptr(), std::ptr::null(), CF_CONNECT_FLAG_REQUIRE_PROCESS_INFO, &mut connection)
+    };
     check(hr, &format!("nu ma pot lega de {}", root.display()))?;
 
     shared.fix_dir_dates();
@@ -1200,7 +1246,7 @@ pub fn run(
             }
             crate::watch::Wake::Timeout => {}
         }
-        if last_sweep.elapsed() >= Duration::from_secs(600) {
+        if last_sweep.elapsed() >= sweep_every {
             shared.free_space();
             last_sweep = Instant::now();
         }

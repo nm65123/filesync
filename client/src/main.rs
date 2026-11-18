@@ -158,6 +158,25 @@ fn lock(home: &Path) -> Res<std::fs::File> {
 
 /// Pornire automata pe Windows: un mic script in dosarul Startup, care lanseaza
 /// clientul fara fereastra, cu jurnalul scris in fisier.
+/// Opreste clientul care ruleaza pe profil, daca ruleaza. Intoarce true daca era unul.
+fn stop_running(home: &Path) -> Res<bool> {
+    let stop_file = home.join("stop");
+    // Daca blocarea se poate lua, nu rula niciun client.
+    if lock(home).is_ok() {
+        let _ = std::fs::remove_file(&stop_file);
+        return Ok(false);
+    }
+    std::fs::write(&stop_file, b"stop").map_err(|e| format!("nu pot scrie {}: {e}", stop_file.display()))?;
+    for _ in 0..100 {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        if lock(home).is_ok() {
+            let _ = std::fs::remove_file(&stop_file);
+            return Ok(true);
+        }
+    }
+    Err("clientul nu s-a oprit in 20 de secunde (poate termina o urcare); mai incearca".into())
+}
+
 /// Ce comanda porneste automat un profil, dupa cum este folosit.
 fn autostart_command(config: &Config) -> Res<&'static str> {
     match (&config.cloud_dir, &config.mount_dir, &config.dir) {
@@ -192,6 +211,9 @@ fn autostart(home: &Path, profile: &str, args: &[String]) -> Res<()> {
         }
         let (config, _) = load(home)?;
         let command = autostart_command(&config)?;
+        if stop_running(home)? {
+            println!("Clientul pornit de mana a fost oprit.");
+        }
         let log = home.join("client.log");
         let script = format!(
             "CreateObject(\"WScript.Shell\").Run \"\"\"{}\"\" {command} --profile {profile} --log \"\"{}\"\"\", 0, False\r\n",
@@ -227,6 +249,9 @@ fn autostart(home: &Path, profile: &str, args: &[String]) -> Res<()> {
         }
         let (config, _) = load(home)?;
         let command = autostart_command(&config)?;
+        if stop_running(home)? {
+            println!("Clientul pornit de mana a fost oprit.");
+        }
         let content = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -290,6 +315,9 @@ fn autostart(home: &Path, profile: &str, args: &[String]) -> Res<()> {
     }
     let (config, _) = load(home)?;
     let command = autostart_command(&config)?;
+    if stop_running(home)? {
+        println!("Clientul pornit de mana a fost oprit.");
+    }
     let content = format!(
         "[Unit]\nDescription=filesync client ({profile})\n\n[Service]\nExecStart={} {command} --profile {profile}\nRestart=on-failure\nRestartSec=30\n\n[Install]\nWantedBy=default.target\n",
         exe.display()
@@ -520,23 +548,12 @@ fn start() -> Res<()> {
             }
         }
         "stop" => {
-            let stop_file = home.join("stop");
-            std::fs::write(&stop_file, b"stop").map_err(|e| format!("nu pot scrie {}: {e}", stop_file.display()))?;
-            // Daca blocarea se poate lua, nu rula niciun client.
-            if lock(&home).is_ok() {
-                let _ = std::fs::remove_file(&stop_file);
+            if stop_running(&home)? {
+                println!("Clientul de pe profilul {profile} s-a oprit.");
+            } else {
                 println!("Niciun client nu ruleaza pe profilul {profile}.");
-                return Ok(());
             }
-            for _ in 0..100 {
-                std::thread::sleep(std::time::Duration::from_millis(200));
-                if lock(&home).is_ok() {
-                    let _ = std::fs::remove_file(&stop_file);
-                    println!("Clientul de pe profilul {profile} s-a oprit.");
-                    return Ok(());
-                }
-            }
-            Err("clientul nu s-a oprit in 20 de secunde (poate termina o urcare); mai incearca".into())
+            Ok(())
         }
         "status" => {
             let (config, _) = load(&home)?;

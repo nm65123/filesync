@@ -53,6 +53,9 @@ struct Tree {
     retry_after: Option<Instant>,
     /// Modificari venite de pe server pentru fisiere care au schimbari locale neurcate.
     held: HashMap<String, Entry>,
+    /// Stergeri locale care pleaca pe server abia dupa o scurta asteptare: Finder (si alte
+    /// programe) sterg si creeaza din nou un fisier abia copiat, iar asa devine o inlocuire.
+    deferred: HashMap<String, (i64, Instant)>,
 }
 
 fn parent_of(path: &str) -> &str {
@@ -92,6 +95,7 @@ impl Tree {
             refreshed: None,
             retry_after: None,
             held: HashMap::new(),
+            deferred: HashMap::new(),
         };
         tree.nodes.insert(ROOT, dir_node(""));
         tree.by_path.insert(String::new(), ROOT);
@@ -314,6 +318,11 @@ impl Shared {
 
     /// Aplica o modificare venita de pe server.
     fn apply(tree: &mut Tree, entry: Entry) -> Vec<PathBuf> {
+        // Un fisier sters local, a carui stergere nu a plecat inca: ce vine despre el de pe
+        // server este ecoul propriei noastre urcari.
+        if tree.deferred.contains_key(&entry.path) && !entry.deleted {
+            return Vec::new();
+        }
         let existing = tree.ino(&entry.path).and_then(|ino| tree.nodes.get(&ino).cloned());
         if let Some(node) = &existing {
             // Schimbarile locale neurcate au prioritate; ce a venit se tine minte pentru conflict.
@@ -567,6 +576,35 @@ impl Shared {
         }
     }
 
+    /// Trimite pe server stergerile locale mai vechi de `age`.
+    fn flush_deferred(&self, age: Duration) {
+        let due: Vec<String> = self
+            .tree()
+            .deferred
+            .iter()
+            .filter(|(_, (_, since))| since.elapsed() >= age)
+            .map(|(path, _)| path.clone())
+            .collect();
+        for path in due {
+            // Stergem ce vedem aici, chiar daca pe server a aparut intre timp alta versiune.
+            match self.api.delete(&path, None) {
+                Ok(()) => {
+                    self.tree().deferred.remove(&path);
+                    (self.log)(&format!("sters     {path}"));
+                }
+                Err(Fail::Refused(m)) if m.starts_with("404") => {
+                    self.tree().deferred.remove(&path);
+                }
+                Err(e) => {
+                    (self.log)(&format!("EROARE    {path}: {e}"));
+                    if let Some(entry) = self.tree().deferred.get_mut(&path) {
+                        entry.1 = Instant::now() + Duration::from_secs(20);
+                    }
+                }
+            }
+        }
+    }
+
     /// Descriptorul fisierului din spatele unui handle, deschis la nevoie.
     fn backing(&self, fh: u64, for_write: bool, empty: bool) -> Result<File, Errno> {
         let (ino, staged, existing) = {
@@ -687,8 +725,14 @@ impl Filesystem for Drive {
                 return reply.error(Errno::ENOENT);
             };
             let path = join(&parent_path, name);
-            // Daca exista deja pe server, urcarea il inlocuieste (versiunea lui se pastreaza).
-            let version = tree.ino(&path).and_then(|i| tree.nodes.get(&i)).map(|n| n.version).unwrap_or(0);
+            // Daca exista deja pe server, urcarea il inlocuieste (versiunea lui se pastreaza);
+            // la fel daca abia a fost sters local si stergerea nu a plecat inca.
+            let version = tree
+                .ino(&path)
+                .and_then(|i| tree.nodes.get(&i))
+                .map(|n| n.version)
+                .or_else(|| tree.deferred.remove(&path).map(|(v, _)| v))
+                .unwrap_or(0);
             let ino = tree.put(Node {
                 path,
                 dir: false,
@@ -846,12 +890,8 @@ impl Filesystem for Drive {
             return reply.error(Errno::EISDIR);
         }
         if node.version != 0 && !node.local_only {
-            // Stergem ce vedem aici, chiar daca pe server a aparut intre timp alta versiune.
-            if let Err(e) = self.0.api.delete(&node.path, None) {
-                (self.0.log)(&format!("EROARE    {}: {e}", node.path));
-                return reply.error(Errno::EIO);
-            }
-            (self.0.log)(&format!("sters     {}", node.path));
+            // Stergerea pleaca pe server dupa o scurta asteptare (vezi Tree::deferred).
+            self.0.tree().deferred.insert(node.path.clone(), (node.version, Instant::now()));
         }
         for path in self.0.tree().remove(&node.path) {
             let _ = std::fs::remove_file(path);
@@ -1085,12 +1125,14 @@ pub fn mount(api: Api, home: &Path, mountpoint: &Path, cache_limit: u64, host: S
     let mut last_retry = Instant::now();
     while !stop.load(Ordering::SeqCst) && !session.guard.is_finished() && !stop_file.exists() {
         std::thread::sleep(Duration::from_millis(300));
+        shared.flush_deferred(Duration::from_secs(3));
         if last_retry.elapsed() > Duration::from_secs(20) {
             let _ = shared.refresh(true);
             shared.retry_pending();
             last_retry = Instant::now();
         }
     }
+    shared.flush_deferred(Duration::ZERO);
     shared.retry_pending();
     let pending = shared.tree().nodes.values().filter(|n| n.dirty && !n.local_only && !n.dir).count();
     if pending > 0 {

@@ -548,6 +548,10 @@ How it behaves:
   the program that saved gets an error, the data stays on your disk, and the
   client retries every 20 seconds.
 - New, changed and deleted files on the server show up within a few seconds.
+- A file you delete is removed from the server after three seconds. If a
+  file with the same name is created in the meantime (the Finder copies that
+  way: write, delete, write again), the server sees one replacement, not a
+  delete and a new file.
 - If a file was changed on the server while you were editing it, your
   version is uploaded as `name (conflict date computer).ext` and the name
   keeps the server's version.
@@ -558,7 +562,9 @@ How it behaves:
   other files cannot be opened until the server is back.
 
 Use a different profile for the drive than for a synced directory.
-`autostart on --profile drive` mounts it at every sign-in (4.4).
+`autostart on --profile drive` mounts it at every sign-in (4.4); it also
+stops a client started by hand. `FILESYNC_TRACE=1` before `mount` logs
+every request the system makes, for debugging.
 
 ### 4.7 Virtual files on Windows
 

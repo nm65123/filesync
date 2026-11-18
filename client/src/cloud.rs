@@ -898,16 +898,25 @@ struct Fetch {
     request: i64,
 }
 
+/// Programele carora nu le aducem continut: indexarea Windows ar descarca tot directorul
+/// ca sa caute in el (numele fisierelor raman cautabile).
+const NO_FETCH: &[&str] = &["searchprotocolhost.exe", "searchindexer.exe", "searchfilterhost.exe"];
+
 /// Apelata de sistem (pe un fir al lui) cand trebuie adus continutul unui fisier.
 unsafe extern "system" fn on_fetch_data(info: *const CF_CALLBACK_INFO, _params: *const CF_CALLBACK_PARAMETERS) {
     let Some(shared) = SHARED.get() else { return };
     // SAFETY: sistemul garanteaza ca `info` si identitatea fisierului sunt valide pe durata apelului.
-    let (path, connection, transfer, request) = unsafe {
+    let (path, connection, transfer, request, who) = unsafe {
         let info = &*info;
         let identity = std::slice::from_raw_parts(info.FileIdentity.cast::<u8>(), info.FileIdentityLength as usize);
-        (String::from_utf8_lossy(identity).into_owned(), info.ConnectionKey, info.TransferKey, info.RequestKey)
+        (String::from_utf8_lossy(identity).into_owned(), info.ConnectionKey, info.TransferKey, info.RequestKey, caller(info))
     };
-    shared.fetch(Fetch { path, connection, transfer, request });
+    let request = Fetch { path, connection, transfer, request };
+    if who.as_deref().is_some_and(|w| NO_FETCH.contains(&w)) {
+        shared.transfer(&request, None);
+        return;
+    }
+    shared.fetch(request);
 }
 
 unsafe extern "system" fn on_cancel_fetch_data(info: *const CF_CALLBACK_INFO, _params: *const CF_CALLBACK_PARAMETERS) {

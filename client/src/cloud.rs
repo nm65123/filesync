@@ -221,31 +221,68 @@ impl Shared {
         Ok(Opened(handle))
     }
 
+    /// Face o operatie pe un substituent printr-un handle exclusiv. Deschiderea cu drept de
+    /// scriere ar face Windows sa aduca intai continutul (chiar si ca sa-l golim), de aceea
+    /// o cerem doar daca operatia refuza handle-ul fara ea.
+    fn with_handle(&self, path: &str, what: &str, op: impl Fn(HANDLE) -> i32) -> Result<(), String> {
+        let opened = self.open(path, CF_OPEN_FILE_FLAG_EXCLUSIVE)?;
+        let hr = op(opened.0);
+        if hr >= 0 {
+            return Ok(());
+        }
+        drop(opened);
+        let opened = self.open(path, CF_OPEN_FILE_FLAG_WRITE_ACCESS | CF_OPEN_FILE_FLAG_EXCLUSIVE)?;
+        check(op(opened.0), what)
+    }
+
+    /// Cat din continutul unui substituent este pe disc (None: nu este substituent).
+    fn on_disk(&self, path: &str) -> Option<u64> {
+        let opened = self.open(path, CF_OPEN_FILE_FLAG_NONE).ok()?;
+        let mut buffer = vec![0u8; std::mem::size_of::<CF_PLACEHOLDER_STANDARD_INFO>() + 4096];
+        let mut returned = 0u32;
+        // SAFETY: tamponul are loc pentru structura si identitate.
+        let hr = unsafe {
+            CfGetPlaceholderInfo(
+                opened.0,
+                CF_PLACEHOLDER_INFO_STANDARD,
+                buffer.as_mut_ptr().cast(),
+                buffer.len() as u32,
+                &mut returned,
+            )
+        };
+        if hr < 0 {
+            return None;
+        }
+        // SAFETY: structura a fost scrisa de API la inceputul tamponului.
+        let info = unsafe { &*(buffer.as_ptr() as *const CF_PLACEHOLDER_STANDARD_INFO) };
+        Some(info.OnDiskDataSize.max(0) as u64)
+    }
+
     /// Fisierul s-a schimbat pe server: substituentul este golit si primeste noile date.
     /// Fara `force`, un fisier cu modificari locale neurcate este lasat in pace.
     fn update(&self, entry: &Entry, force: bool) -> Result<(), String> {
-        let opened = self.open(&entry.path, CF_OPEN_FILE_FLAG_WRITE_ACCESS | CF_OPEN_FILE_FLAG_EXCLUSIVE)?;
         let meta = metadata(false, entry.size, entry.mtime);
         let identity = entry.path.as_bytes();
         let mut flags = CF_UPDATE_FLAG_DEHYDRATE | CF_UPDATE_FLAG_MARK_IN_SYNC;
         if !force {
             flags |= CF_UPDATE_FLAG_VERIFY_IN_SYNC;
         }
-        // SAFETY: handle-ul este valid; adresele traiesc pe durata apelului.
-        let hr = unsafe {
-            CfUpdatePlaceholder(
-                opened.0,
-                &meta,
-                identity.as_ptr().cast(),
-                identity.len() as u32,
-                std::ptr::null(),
-                0,
-                flags,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
-        check(hr, "actualizare substituent")
+        self.with_handle(&entry.path, "actualizare substituent", |handle| {
+            // SAFETY: handle-ul este valid; adresele traiesc pe durata apelului.
+            unsafe {
+                CfUpdatePlaceholder(
+                    handle,
+                    &meta,
+                    identity.as_ptr().cast(),
+                    identity.len() as u32,
+                    std::ptr::null(),
+                    0,
+                    flags,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            }
+        })
     }
 
     /// Un fisier obisnuit, abia urcat, devine substituent (cu continutul pastrat local).
@@ -420,22 +457,23 @@ impl Shared {
             if !old {
                 continue;
             }
-            let Ok(opened) = self.open(&path, CF_OPEN_FILE_FLAG_WRITE_ACCESS) else { continue };
             let meta = metadata(true, 0, 0);
-            // SAFETY: handle valid; metadatele traiesc pe durata apelului.
-            unsafe {
-                CfUpdatePlaceholder(
-                    opened.0,
-                    &meta,
-                    std::ptr::null(),
-                    0,
-                    std::ptr::null(),
-                    0,
-                    CF_UPDATE_FLAG_NONE,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                );
-            }
+            let _ = self.with_handle(&path, "data directorului", |handle| {
+                // SAFETY: handle valid; metadatele traiesc pe durata apelului.
+                unsafe {
+                    CfUpdatePlaceholder(
+                        handle,
+                        &meta,
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        0,
+                        CF_UPDATE_FLAG_NONE,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    )
+                }
+            });
         }
     }
 
@@ -468,12 +506,18 @@ impl Shared {
             if local.dir || local.size != k.size || local.mtime != k.mtime {
                 continue;
             }
-            let Ok(opened) = self.open(&path, CF_OPEN_FILE_FLAG_WRITE_ACCESS | CF_OPEN_FILE_FLAG_EXCLUSIVE) else {
-                continue; // este folosit de un program; alta data
-            };
-            // SAFETY: handle valid; lungimea -1 inseamna pana la sfarsit.
-            let hr = unsafe { CfDehydratePlaceholder(opened.0, 0, -1, CF_DEHYDRATE_FLAG_NONE, std::ptr::null_mut()) };
-            if hr >= 0 {
+            // Fara continut pe disc: nu e nimic de eliberat (si nici nu-l atingem).
+            if self.on_disk(&path) == Some(0) {
+                if let Some(k) = self.state().files.get_mut(&path) {
+                    k.opened = 0;
+                }
+                continue;
+            }
+            let result = self.with_handle(&path, "eliberare", |handle| {
+                // SAFETY: handle valid; lungimea -1 inseamna pana la sfarsit.
+                unsafe { CfDehydratePlaceholder(handle, 0, -1, CF_DEHYDRATE_FLAG_NONE, std::ptr::null_mut()) }
+            });
+            if result.is_ok() {
                 if let Some(k) = self.state().files.get_mut(&path) {
                     k.opened = 0;
                 }

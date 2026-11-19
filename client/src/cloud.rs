@@ -29,9 +29,10 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::Storage::CloudFilters::*;
 use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FILE_WRITE_ATTRIBUTES, OPEN_EXISTING,
+    CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_OFFLINE,
+    FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES,
+    GetFileAttributesW, INVALID_FILE_ATTRIBUTES, OPEN_EXISTING,
 };
 use windows_sys::core::GUID;
 
@@ -268,7 +269,17 @@ impl Shared {
         check(op(opened.0), what)
     }
 
+    /// Este un substituent fara continut local? Se vede din atributele pe care Windows le pune
+    /// singur (fara sa deschidem nimic).
+    fn dehydrated(&self, path: &str) -> bool {
+        let wide = wide_path(&self.local(path));
+        // SAFETY: sir UTF-16 terminat cu zero.
+        let attrs = unsafe { GetFileAttributesW(wide.as_ptr()) };
+        attrs != INVALID_FILE_ATTRIBUTES && attrs & (FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS | FILE_ATTRIBUTE_OFFLINE) != 0
+    }
+
     /// Cat din continutul unui substituent este pe disc (None: nu este substituent).
+    #[allow(dead_code)]
     fn on_disk(&self, path: &str) -> Option<u64> {
         let opened = self.open_attributes(path, false).ok()?;
         let mut buffer = vec![0u8; std::mem::size_of::<CF_PLACEHOLDER_STANDARD_INFO>() + 4096];
@@ -294,6 +305,13 @@ impl Shared {
     /// Fisierul s-a schimbat pe server: substituentul este golit si primeste noile date.
     /// Fara `force`, un fisier cu modificari locale neurcate este lasat in pace.
     fn update(&self, entry: &Entry, force: bool) -> Result<(), String> {
+        // Un substituent gol nu poate avea modificari locale si n-are ce pierde: il facem din
+        // nou, in loc sa-l deschidem (orice handle cu acces la date i-ar aduce continutul vechi).
+        if self.dehydrated(&entry.path) {
+            let local = self.local(&entry.path);
+            std::fs::remove_file(&local).map_err(|e| format!("nu pot inlocui substituentul: {e}"))?;
+            return self.create(entry);
+        }
         let meta = metadata(false, entry.size, entry.mtime);
         let identity = entry.path.as_bytes();
         let mut flags = CF_UPDATE_FLAG_DEHYDRATE | CF_UPDATE_FLAG_MARK_IN_SYNC;
@@ -540,7 +558,7 @@ impl Shared {
                 continue;
             }
             // Fara continut pe disc: nu e nimic de eliberat (si nici nu-l atingem).
-            if self.on_disk(&path) == Some(0) {
+            if self.dehydrated(&path) {
                 if let Some(k) = self.state().files.get_mut(&path) {
                     k.opened = 0;
                 }

@@ -27,7 +27,12 @@ use windows_sys::Win32::Foundation::{
     ERROR_SHARING_VIOLATION, HANDLE, STATUS_CLOUD_FILE_UNSUCCESSFUL, STATUS_SUCCESS,
 };
 use windows_sys::Win32::Storage::CloudFilters::*;
-use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_BASIC_INFO};
+use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FILE_WRITE_ATTRIBUTES, OPEN_EXISTING,
+};
 use windows_sys::core::GUID;
 
 /// Identitatea furnizorului, fixa (o alegem noi o singura data).
@@ -218,16 +223,44 @@ impl Shared {
         // SAFETY: `wide` este un sir UTF-16 terminat cu zero; `handle` primeste rezultatul.
         let hr = unsafe { CfOpenFileWithOplock(wide.as_ptr(), flags, &mut handle) };
         check(hr, "deschidere")?;
-        Ok(Opened(handle))
+        Ok(Opened(handle, true))
+    }
+
+    /// Deschide numai pentru atribute: singurul fel de a atinge un substituent fara continut
+    /// fara ca Windows sa-i aduca continutul (politica "Full" hidrateaza la deschiderea cu
+    /// acces la date, oricare ar fi optiunile lui CfOpenFileWithOplock).
+    fn open_attributes(&self, path: &str, write: bool) -> Result<Opened, String> {
+        let wide = wide_path(&self.local(path));
+        let access = FILE_READ_ATTRIBUTES | if write { FILE_WRITE_ATTRIBUTES } else { 0 };
+        // SAFETY: sir UTF-16 terminat cu zero; fara atribute de securitate si fara sablon.
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+            return Err("deschidere: nu exista local sau este folosit".into());
+        }
+        Ok(Opened(handle, false))
     }
 
     /// Face o operatie pe un substituent printr-un handle exclusiv. Deschiderea cu drept de
     /// scriere ar face Windows sa aduca intai continutul (chiar si ca sa-l golim), de aceea
     /// o cerem doar daca operatia refuza handle-ul fara ea.
     fn with_handle(&self, path: &str, what: &str, op: impl Fn(HANDLE) -> i32) -> Result<(), String> {
+        if let Ok(opened) = self.open_attributes(path, true) {
+            if op(opened.0) >= 0 {
+                return Ok(());
+            }
+        }
         let opened = self.open(path, CF_OPEN_FILE_FLAG_EXCLUSIVE)?;
-        let hr = op(opened.0);
-        if hr >= 0 {
+        if op(opened.0) >= 0 {
             return Ok(());
         }
         drop(opened);
@@ -237,7 +270,7 @@ impl Shared {
 
     /// Cat din continutul unui substituent este pe disc (None: nu este substituent).
     fn on_disk(&self, path: &str) -> Option<u64> {
-        let opened = self.open(path, CF_OPEN_FILE_FLAG_NONE).ok()?;
+        let opened = self.open_attributes(path, false).ok()?;
         let mut buffer = vec![0u8; std::mem::size_of::<CF_PLACEHOLDER_STANDARD_INFO>() + 4096];
         let mut returned = 0u32;
         // SAFETY: tamponul are loc pentru structura si identitate.
@@ -323,7 +356,7 @@ impl Shared {
 
     /// Identitatea unui substituent (calea de la creare); None pentru un fisier obisnuit.
     fn identity(&self, path: &str) -> Option<String> {
-        let opened = self.open(path, CF_OPEN_FILE_FLAG_NONE).ok()?;
+        let opened = self.open_attributes(path, false).ok()?;
         let mut buffer = vec![0u8; std::mem::size_of::<CF_PLACEHOLDER_BASIC_INFO>() + 4096];
         let mut returned = 0u32;
         // SAFETY: tamponul are loc pentru structura si pentru o identitate de cel mult 4 KB.
@@ -924,13 +957,20 @@ impl Shared {
     }
 }
 
-/// Un handle primit de la CfOpenFileWithOplock, inchis automat.
-struct Opened(HANDLE);
+/// Un handle deschis de noi, inchis automat: de la CfOpenFileWithOplock (protejat, cu acces
+/// la date) sau de la CreateFileW (numai atribute).
+struct Opened(HANDLE, bool);
 
 impl Drop for Opened {
     fn drop(&mut self) {
-        // SAFETY: handle-ul a fost primit de la CfOpenFileWithOplock si se inchide o singura data.
-        unsafe { CfCloseHandle(self.0) };
+        // SAFETY: handle-ul a fost primit de la functia potrivita si se inchide o singura data.
+        unsafe {
+            if self.1 {
+                CfCloseHandle(self.0);
+            } else {
+                CloseHandle(self.0);
+            }
+        }
     }
 }
 

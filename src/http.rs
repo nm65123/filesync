@@ -2,8 +2,9 @@ use crate::index;
 use crate::util::{human, safe, set_mtime, verify_password};
 use axum::{
     body::Body,
-    extract::{Path, Query, Request, State},
+    extract::{ConnectInfo, Path, Query, Request, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
+    middleware::Next,
     response::{IntoResponse, Response},
     routing::{any, get},
     Json, Router,
@@ -26,6 +27,8 @@ pub struct App {
     pub tls: bool,
     /// Adresa publica (FILESYNC_URL), folosita in linkurile de partajare.
     pub public_url: Option<String>,
+    /// FILESYNC_LOG=access: o linie in jurnal pentru fiecare cerere.
+    pub access_log: bool,
 }
 
 pub struct User {
@@ -49,6 +52,7 @@ pub fn router(app: App) -> Router {
         .route("/dav/{*path}", any(dav_path))
         .merge(crate::share::routes())
         .merge(crate::web::routes())
+        .layer(axum::middleware::from_fn_with_state(app.clone(), access_log))
         .with_state(app)
 }
 
@@ -126,6 +130,38 @@ pub async fn auth(app: &App, headers: &HeaderMap) -> Result<User, Response> {
     let decoded = String::from_utf8(decoded).map_err(|_| unauthorized())?;
     let (name, secret) = decoded.split_once(':').ok_or_else(unauthorized)?;
     credentials(app, name, secret).await
+}
+
+/// Jurnalul de acces (FILESYNC_LOG=access): metoda, calea, codul, cine, de unde, durata.
+async fn access_log(State(app): State<App>, req: Request, next: Next) -> Response {
+    if !app.access_log || req.uri().path() == "/health" {
+        return next.run(req).await;
+    }
+    let started = std::time::Instant::now();
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let who = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Basic "))
+        .and_then(|v| base64::engine::general_purpose::STANDARD.decode(v).ok())
+        .and_then(|v| String::from_utf8(v).ok())
+        .and_then(|v| v.split_once(':').map(|(name, _)| name.to_string()))
+        .or_else(|| req.headers().get(header::COOKIE).map(|_| "sesiune".to_string()))
+        .unwrap_or_else(|| "-".to_string());
+    let from = req
+        .extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+        .map(|c| c.0.ip().to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let response = next.run(req).await;
+    println!(
+        "{method} {path} {} {who} {from} {}ms",
+        response.status().as_u16(),
+        started.elapsed().as_millis()
+    );
+    response
 }
 
 /// Verifica numele si parola sau tokenul; 401 daca nu se potrivesc.

@@ -680,6 +680,7 @@ Set in `/etc/filesync.env`; restart the service after a change.
 | `FILESYNC_TLS_KEY`       | `$FILESYNC_DATA/tls/key.pem`  | private key (PEM)                    |
 | `FILESYNC_INSECURE_HTTP` | unset                         | `1` allows plain HTTP on the network |
 | `FILESYNC_URL`           | unset                         | public address, used in share links  |
+| `FILESYNC_LOG`           | unset                         | `access`: one line per request in the journal (method, path, status, user, address, time) |
 
 If the certificate and key exist, the server speaks HTTPS. Without them it
 speaks plain HTTP, and only on `127.0.0.1`, because passwords would otherwise

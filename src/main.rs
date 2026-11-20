@@ -132,6 +132,7 @@ async fn start() -> Result<(), Box<dyn std::error::Error>> {
             .ok()
             .map(|url| url.trim_end_matches('/').to_string())
             .filter(|url| !url.is_empty()),
+        access_log: std::env::var("FILESYNC_LOG").is_ok_and(|v| v.split(',').any(|p| p.trim() == "access")),
     });
 
     let addr: SocketAddr = std::env::var("FILESYNC_LISTEN")
@@ -143,7 +144,7 @@ async fn start() -> Result<(), Box<dyn std::error::Error>> {
         let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key).await?;
         println!("ascult pe https://{addr}");
         axum_server::bind_rustls(addr, config)
-            .serve(app.into_make_service())
+            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await?;
     } else {
         // Fara TLS parolele ar circula necriptat, deci acceptam doar adresa locala,
@@ -159,7 +160,7 @@ async fn start() -> Result<(), Box<dyn std::error::Error>> {
         }
         println!("ascult pe http://{addr} (fara TLS)");
         let listener = tokio::net::TcpListener::bind(addr).await?;
-        axum::serve(listener, app).await?;
+        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
     }
     Ok(())
 }

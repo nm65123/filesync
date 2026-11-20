@@ -256,8 +256,13 @@ async fn upload(
         }
     }
 
+    // Fisierul temporar sta in directorul utilizatorului, nu in tmp/: mutarea finala trebuie
+    // sa ramana pe acelasi dispozitiv (directorul utilizatorului poate fi un bind mount sau
+    // alt disc). Numele incepe cu ".filesync-part-", pe care clientii si indexul il ignora.
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp = app.data.join("tmp").join(format!("{}-{n}.part", std::process::id()));
+    let user_root = app.data.join("files").join(&user.name);
+    tokio::fs::create_dir_all(&user_root).await.map_err(internal)?;
+    let tmp = user_root.join(format!(".filesync-part-{}-{n}", std::process::id()));
     let (hash, size) = match receive(body, &tmp, limit).await {
         Ok(v) => v,
         Err(e) => {
@@ -287,7 +292,17 @@ async fn upload(
     if let Some(parent) = dest.parent() {
         tokio::fs::create_dir_all(parent).await.map_err(internal)?;
     }
-    tokio::fs::rename(&tmp, &dest).await.map_err(internal)?;
+    if let Err(e) = tokio::fs::rename(&tmp, &dest).await {
+        // Alt dispozitiv totusi (de exemplu un subdirector montat separat): copiem.
+        if e.raw_os_error() == Some(18) {
+            let copied = tokio::fs::copy(&tmp, &dest).await;
+            let _ = tokio::fs::remove_file(&tmp).await;
+            copied.map_err(internal)?;
+        } else {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(internal(e));
+        }
+    }
     let mtime = oc_mtime(&headers);
     if let Some(secs) = mtime {
         set_mtime(&dest, secs).map_err(internal)?;

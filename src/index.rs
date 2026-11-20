@@ -100,6 +100,9 @@ fn walk(root: &Path, rel: &str, found: &mut HashMap<String, OnDisk>) {
                 eprintln!("ignorat (nume care nu este UTF-8): {:?}", entry.path());
                 continue;
             };
+            if name.starts_with(".filesync-part-") {
+                continue; // transfer in curs
+            }
             let child = if rel.is_empty() { name } else { format!("{rel}/{name}") };
             walk(root, &child, found);
         }

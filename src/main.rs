@@ -85,6 +85,18 @@ async fn start() -> Result<(), Box<dyn std::error::Error>> {
     let tmp = data.join("tmp");
     let _ = tokio::fs::remove_dir_all(&tmp).await; // resturi de la transferuri intrerupte
     tokio::fs::create_dir_all(&tmp).await?;
+    // Resturi de transferuri intrerupte din directoarele utilizatorilor.
+    if let Ok(mut users) = tokio::fs::read_dir(data.join("files")).await {
+        while let Ok(Some(user)) = users.next_entry().await {
+            if let Ok(mut entries) = tokio::fs::read_dir(user.path()).await {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    if entry.file_name().to_string_lossy().starts_with(".filesync-part-") {
+                        let _ = tokio::fs::remove_file(entry.path()).await;
+                    }
+                }
+            }
+        }
+    }
 
     // TLS: din variabile, sau certificatul creat cu `filesync gencert`.
     let cert = std::env::var("FILESYNC_TLS_CERT")

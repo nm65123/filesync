@@ -48,6 +48,7 @@ pub fn router(app: App) -> Router {
         .route("/dav/", any(dav_root))
         .route("/dav/{*path}", any(dav_path))
         .merge(crate::share::routes())
+        .merge(crate::web::routes())
         .with_state(app)
 }
 
@@ -110,6 +111,10 @@ fn content_length(headers: &HeaderMap) -> Option<u64> {
 
 /// Verifica tokenul sau parola din antetul Authorization (HTTP Basic).
 pub async fn auth(app: &App, headers: &HeaderMap) -> Result<User, Response> {
+    // Interfata web: sesiune in cookie. Altfel: HTTP Basic cu parola sau token.
+    if let Some(user) = crate::web::session_user(app, headers).await? {
+        return Ok(user);
+    }
     let value = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -120,7 +125,11 @@ pub async fn auth(app: &App, headers: &HeaderMap) -> Result<User, Response> {
         .map_err(|_| unauthorized())?;
     let decoded = String::from_utf8(decoded).map_err(|_| unauthorized())?;
     let (name, secret) = decoded.split_once(':').ok_or_else(unauthorized)?;
+    credentials(app, name, secret).await
+}
 
+/// Verifica numele si parola sau tokenul; 401 daca nu se potrivesc.
+pub async fn credentials(app: &App, name: &str, secret: &str) -> Result<User, Response> {
     let (id, password, active) = sqlx::query_as::<_, (i32, String, bool)>(
         "SELECT id, password, active FROM users WHERE name = $1",
     )

@@ -3,13 +3,14 @@ mod http;
 mod index;
 mod share;
 mod util;
+mod web;
 
 use dav_server::{fakels::FakeLs, DavHandler};
 use sqlx::postgres::PgPoolOptions;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-const SCHEMA: [&str; 15] = [
+const SCHEMA: [&str; 16] = [
     "CREATE TABLE IF NOT EXISTS users (
         id       SERIAL PRIMARY KEY,
         name     TEXT NOT NULL UNIQUE,
@@ -43,6 +44,13 @@ const SCHEMA: [&str; 15] = [
     "CREATE INDEX IF NOT EXISTS files_owner_seq ON files (owner, seq)",
     // Randurile dinaintea indexului primesc si ele un numar de ordine
     "UPDATE files SET seq = nextval('files_seq') WHERE seq = 0",
+    // Sesiunile interfetei web
+    "CREATE TABLE IF NOT EXISTS sessions (
+        token   TEXT PRIMARY KEY,
+        user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created TIMESTAMPTZ NOT NULL DEFAULT now(),
+        expires TIMESTAMPTZ NOT NULL
+    )",
     // Linkuri publice de partajare
     "CREATE TABLE IF NOT EXISTS shares (
         token     TEXT PRIMARY KEY,

@@ -6,7 +6,8 @@ Files only: no calendar, no contacts, no office suite.
 **Status: early development. Not ready for production use.**
 
 - Files are stored as plain files on disk, one directory per user.
-- Access over HTTPS: WebDAV at `/dav/` and a simple `PUT`/`GET` API at `/files/`.
+- Access over HTTPS: a web page at `/`, WebDAV at `/dav/` and a simple
+  `PUT`/`GET` API at `/files/`.
 - Users exist only in the database (no system accounts), each with an
   optional quota.
 - Built-in HTTPS with a self-signed certificate. It works with a bare IP
@@ -328,6 +329,20 @@ curl -u alice:TOKEN -X DELETE https://192.168.0.48:8443/api/shares/CODE  # delet
 If people outside reach the server under another address than the one it
 listens on (a domain name, a forwarded port), set `FILESYNC_URL` to that
 address so the links are printed correctly.
+
+### 3.7 Web page
+
+Open `https://192.168.0.48:8443/` in a browser and sign in with the user name
+and the password (or a token). The page lists the files; a click on a file
+downloads it, a click on a directory opens it. Files are uploaded with the
+*Incarca fisiere* button or by dragging them onto the list (their original
+dates are kept). Each row has buttons for a public link (optionally with a
+password and an expiry), renaming and deleting; *Linkuri publice* lists the
+links already made and lets you delete them. *Iesire* signs out.
+
+The sign-in is kept in a cookie for 30 days. The page uses the same API as
+the sync client, so nothing else runs on the server for it; there is no
+preview or editing, and users are still managed on the command line.
 
 ---
 
@@ -708,7 +723,7 @@ Back up the data directory and the database together.
 - The group and administrator flag are stored but not used yet.
 - Server messages are in Romanian.
 
-Planned: delta transfers (rsync algorithm), a web interface.
+Planned: delta transfers (rsync algorithm).
 
 ## License
 
